@@ -1,0 +1,21 @@
+# Build outputs
+*.obj
+*.pdb
+*.ilk
+Test.cs
+Test.exe
+WatermarkWindow.dll
+
+# Test screenshots
+screenshot_*.png
+Verify.ps1
+
+# User-specific & local configs
+config.ini
+Thumbs.db
+[Dd]esktop.ini
+
+# Temporary files
+*.tmp
+*.bak
+*.log
