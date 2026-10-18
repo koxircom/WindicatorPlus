@@ -10,7 +10,7 @@ namespace WindicatorPlus
 {
     public class SettingsForm : Form
     {
-        public const string CURRENT_VERSION = "v1.3.0";
+        public const string CURRENT_VERSION = "v1.3.1";
 
 
         private AppConfig _config;
@@ -52,6 +52,9 @@ namespace WindicatorPlus
         private TrackBar _tbOpacity;
         private Label _lblOpacityVal;
         private TextBox _txtTitleTpl;
+        private TrackBar _tbTitleFontSize;
+        private Label _lblTitleFontSizeVal;
+        private CheckBox _chkShowSubtitle;
         private TextBox _txtSubtitleTpl;
         private DarkToggleSwitch _swShowBigNum;
         private DarkToggleSwitch _swShowCard;
@@ -1033,7 +1036,49 @@ namespace WindicatorPlus
                 ApplyDesignerChanges();
             };
 
+            _tbTitleFontSize = AddSliderRow(
+                cardTemplate,
+                "主标题字号",
+                "仅桌面水印生效；任务栏按栏高自动计算最佳字号",
+                10,
+                48,
+                _config.TitleFontSize > 0 ? _config.TitleFontSize : 14,
+                "px",
+                out _lblTitleFontSizeVal);
+
+            _tbTitleFontSize.Scroll += (s, e) =>
+            {
+                if (_isBindingUI) return;
+                int val = _tbTitleFontSize.Value;
+                _lblTitleFontSizeVal.Text = val + "px";
+                _config.TitleFontSize = val;
+                ApplyDesignerChanges();
+            };
+
+            _chkShowSubtitle = new CheckBox
+            {
+                Text = "显示副标题模板 (未勾选时仅显示主标题并水平垂直双向居中)",
+                ForeColor = Color.FromArgb(220, 225, 235),
+                Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Regular),
+                AutoSize = true,
+                Checked = _config.ShowSubtitle,
+                Cursor = Cursors.Hand,
+                Margin = new Padding(0, 10, 0, 6)
+            };
+            _chkShowSubtitle.CheckedChanged += (s, e) =>
+            {
+                if (_isBindingUI) return;
+                _config.ShowSubtitle = _chkShowSubtitle.Checked;
+                if (_txtSubtitleTpl != null)
+                {
+                    _txtSubtitleTpl.Enabled = _chkShowSubtitle.Checked;
+                }
+                ApplyDesignerChanges();
+            };
+            AddToCard(cardTemplate, _chkShowSubtitle);
+
             _txtSubtitleTpl = AddInputRow(cardTemplate, "副标题模板：", _config.SubtitleTemplate ?? "虚拟桌面 {n} (共 {total} 个)");
+            _txtSubtitleTpl.Enabled = _config.ShowSubtitle;
             _txtSubtitleTpl.TextChanged += (s, e) =>
             {
                 if (_isBindingUI) return;
@@ -1150,7 +1195,9 @@ namespace WindicatorPlus
                     _config.SubtitleTemplate,
                     _config.ShowBigNumber,
                     _config.ShowBackgroundCard,
-                    _config.WatermarkColorTheme);
+                    _config.WatermarkColorTheme,
+                    _config.ShowSubtitle,
+                    _config.TitleFontSize);
             }
             SafeSaveConfig();
         }
@@ -1727,7 +1774,21 @@ namespace WindicatorPlus
 
                 // Templates
                 if (_txtTitleTpl != null) _txtTitleTpl.Text = _config.TitleTemplate ?? "{name}";
-                if (_txtSubtitleTpl != null) _txtSubtitleTpl.Text = _config.SubtitleTemplate ?? "虚拟桌面 {n} (共 {total} 个)";
+                if (_tbTitleFontSize != null)
+                {
+                    int fs = _config.TitleFontSize > 0 ? Math.Max(10, Math.Min(48, _config.TitleFontSize)) : 14;
+                    _tbTitleFontSize.Value = fs;
+                    if (_lblTitleFontSizeVal != null) _lblTitleFontSizeVal.Text = fs + "px";
+                }
+                if (_chkShowSubtitle != null)
+                {
+                    _chkShowSubtitle.Checked = _config.ShowSubtitle;
+                }
+                if (_txtSubtitleTpl != null)
+                {
+                    _txtSubtitleTpl.Text = _config.SubtitleTemplate ?? "虚拟桌面 {n} (共 {total} 个)";
+                    _txtSubtitleTpl.Enabled = _config.ShowSubtitle;
+                }
                 if (_swShowBigNum != null) _swShowBigNum.Checked = _config.ShowBigNumber;
                 if (_swShowCard != null) _swShowCard.Checked = _config.ShowBackgroundCard;
 
@@ -1790,6 +1851,8 @@ namespace WindicatorPlus
                     _config.WatermarkOpacity = 40;
                     _config.TitleTemplate = "{name}";
                     _config.SubtitleTemplate = "虚拟桌面 {n} (共 {total} 个)";
+                    _config.ShowSubtitle = false;
+                    _config.TitleFontSize = 14;
                     _config.ShowBigNumber = true;
                     _config.ShowBackgroundCard = true;
                     _config.WatermarkColorTheme = "WhiteHighlight";
@@ -1797,7 +1860,13 @@ namespace WindicatorPlus
                     if (_tbScale != null) { _tbScale.Value = 100; _lblScaleVal.Text = "100%"; }
                     if (_tbOpacity != null) { _tbOpacity.Value = 40; _lblOpacityVal.Text = "40%"; }
                     if (_txtTitleTpl != null) _txtTitleTpl.Text = "{name}";
-                    if (_txtSubtitleTpl != null) _txtSubtitleTpl.Text = "虚拟桌面 {n} (共 {total} 个)";
+                    if (_tbTitleFontSize != null) { _tbTitleFontSize.Value = 14; _lblTitleFontSizeVal.Text = "14px"; }
+                    if (_chkShowSubtitle != null) _chkShowSubtitle.Checked = false;
+                    if (_txtSubtitleTpl != null)
+                    {
+                        _txtSubtitleTpl.Text = "虚拟桌面 {n} (共 {total} 个)";
+                        _txtSubtitleTpl.Enabled = false;
+                    }
                     if (_swShowBigNum != null) _swShowBigNum.Checked = true;
                     if (_swShowCard != null) _swShowCard.Checked = true;
                     if (_cbColorTheme != null) _cbColorTheme.SelectedIndex = 0;

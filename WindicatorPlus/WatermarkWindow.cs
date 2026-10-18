@@ -31,6 +31,8 @@ namespace WindicatorPlus
         private int _watermarkScale = 100;
         private string _titleTemplate = "{name}";
         private string _subtitleTemplate = "虚拟桌面 {n} (共 {total} 个)";
+        private bool _showSubtitle = false;
+        private int _titleFontSize = 14;
         private bool _showBigNumber = true;
         private bool _showBackgroundCard = true;
         private string _colorTheme = "WhiteHighlight";
@@ -79,6 +81,8 @@ namespace WindicatorPlus
         }
 
         internal byte LastCalculatedAlpha { get; private set; }
+        internal Bitmap LastRenderedBitmapForTest { get; private set; }
+        internal bool CaptureRenderedBitmapForTesting { get; set; }
 
         internal bool HasTaskbarIntent
         {
@@ -565,6 +569,8 @@ namespace WindicatorPlus
             _watermarkScale = config.WatermarkScale;
             _titleTemplate = config.TitleTemplate;
             _subtitleTemplate = config.SubtitleTemplate;
+            _showSubtitle = config.ShowSubtitle;
+            _titleFontSize = config.TitleFontSize > 0 ? Math.Max(10, Math.Min(48, config.TitleFontSize)) : 14;
             _showBigNumber = config.ShowBigNumber;
             _showBackgroundCard = config.ShowBackgroundCard;
             _colorTheme = config.WatermarkColorTheme;
@@ -667,12 +673,19 @@ namespace WindicatorPlus
 
         public void SetDesignerProps(int scale, string titleTpl, string subTpl, bool showBigNum, bool showCard, string colorTheme)
         {
+            SetDesignerProps(scale, titleTpl, subTpl, showBigNum, showCard, colorTheme, _showSubtitle, _titleFontSize);
+        }
+
+        public void SetDesignerProps(int scale, string titleTpl, string subTpl, bool showBigNum, bool showCard, string colorTheme, bool showSubtitle, int titleFontSize = 14)
+        {
             _watermarkScale = Math.Max(70, Math.Min(180, scale));
             _titleTemplate = titleTpl;
             _subtitleTemplate = subTpl;
             _showBigNumber = showBigNum;
             _showBackgroundCard = showCard;
             _colorTheme = colorTheme;
+            _showSubtitle = showSubtitle;
+            _titleFontSize = Math.Max(10, Math.Min(48, titleFontSize));
 
             if (_isEnabled && Visible)
             {
@@ -917,13 +930,30 @@ namespace WindicatorPlus
                 else if (_style == "Badge") { baseW = 190; baseH = 54; }
                 else if (_style == "TextZh" || _style == "TextEn") { baseW = 220; baseH = 76; }
 
-                if (!string.IsNullOrEmpty(titleText) && titleText.Length > 4)
-                {
-                    baseW += Math.Min(160, (titleText.Length - 4) * 16);
-                }
+                string subText = ParseTemplate(_subtitleTemplate);
 
-                w = Math.Max(100, (int)(baseW * scale));
-                h = Math.Max(40, (int)(baseH * scale));
+                if (_style == "Card")
+                {
+                    Size cardSz = CalculateCardWindowSize(scale, _currentDesktop, titleText, subText, _showBigNumber, _showSubtitle, _titleFontSize);
+                    w = cardSz.Width;
+                    h = cardSz.Height;
+                }
+                else if (_style == "TextZh" || _style == "TextEn")
+                {
+                    Size textSize = CalculateCardWindowSize(scale, _currentDesktop, titleText, subText, false, _showSubtitle, _titleFontSize);
+                    w = textSize.Width;
+                    h = textSize.Height;
+                }
+                else
+                {
+                    if (!string.IsNullOrEmpty(titleText) && titleText.Length > 4)
+                    {
+                        baseW += Math.Min(160, (titleText.Length - 4) * 16);
+                    }
+
+                    w = Math.Max(100, (int)(baseW * scale));
+                    h = Math.Max(40, (int)(baseH * scale));
+                }
 
                 _windowWidth = w;
                 _windowHeight = h;
@@ -987,7 +1017,9 @@ namespace WindicatorPlus
                     g.SmoothingMode = SmoothingMode.AntiAlias;
                     g.TextRenderingHint = _isTaskbarDocked ? TextRenderingHint.AntiAliasGridFit : TextRenderingHint.ClearTypeGridFit;
                     g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                    g.Clear(Color.Transparent);
+                    // 任务栏模式下整个 widget 矩形预填 Alpha=1 黑色底（肉眼不可察无可见边框），阻止 OS 将透明区域视为穿透
+                    // 桌面水印模式仍使用完全 Alpha=0 透明背景，保持 100% 桌面背景穿透
+                    g.Clear(_isTaskbarDocked ? Color.FromArgb(1, 0, 0, 0) : Color.Transparent);
 
                     if (_isTaskbarDocked)
                     {
@@ -1041,6 +1073,7 @@ namespace WindicatorPlus
                 bool ulwSuccess = false;
                 try
                 {
+                    if (_isTaskbarDocked) ApplyTaskbarPixelOpacity(bmp, alpha);
                     screenDc = NativeMethods.GetDC(IntPtr.Zero);
                     memDc = NativeMethods.CreateCompatibleDC(screenDc);
                     hBitmap = bmp.GetHbitmap(Color.FromArgb(0));
@@ -1053,7 +1086,9 @@ namespace WindicatorPlus
                     NativeMethods.BLENDFUNCTION blend = new NativeMethods.BLENDFUNCTION();
                     blend.BlendOp = NativeMethods.AC_SRC_OVER;
                     blend.BlendFlags = 0;
-                    blend.SourceConstantAlpha = alpha;
+                    // 任务栏模式下固定 SourceConstantAlpha 为 255，保障 alpha1 底色的有效 alpha 恒保持 nonzero (1*255/255=1)，彻底杜绝 OS 命中截断穿透
+                    // 桌面水印模式使用配置透明度 alpha 进行半透明合成
+                    blend.SourceConstantAlpha = _isTaskbarDocked ? (byte)255 : alpha;
                     blend.AlphaFormat = NativeMethods.AC_SRC_ALPHA;
 
                     ulwSuccess = NativeMethods.UpdateLayeredWindow(
@@ -1062,6 +1097,15 @@ namespace WindicatorPlus
                     if (ulwSuccess)
                     {
                         _actualScreenRect = new Rectangle(posX, posY, _windowWidth, _windowHeight);
+                        if (CaptureRenderedBitmapForTesting) try
+                        {
+                            if (LastRenderedBitmapForTest != null)
+                            {
+                                LastRenderedBitmapForTest.Dispose();
+                            }
+                            LastRenderedBitmapForTest = (Bitmap)bmp.Clone();
+                        }
+                        catch { }
                     }
                 }
                 finally
@@ -1373,6 +1417,26 @@ namespace WindicatorPlus
         }
 
         // Transparent overlay single-line widget: "数字 | 开发调试" (no background, no border, no subtitle/counter/drag-hint)
+        internal static void ApplyTaskbarPixelOpacity(Bitmap bitmap, byte opacity)
+        {
+            // Bake user opacity into the pixels, retaining alpha=1 in blank hit-area pixels.
+            // SourceConstantAlpha must stay 255 so Windows does not round the hit surface to zero.
+            BitmapData data = bitmap.LockBits(new Rectangle(0, 0, bitmap.Width, bitmap.Height), ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+            try
+            {
+                byte[] row = new byte[bitmap.Width * 4];
+                for (int y = 0; y < bitmap.Height; y++)
+                {
+                    IntPtr address = IntPtr.Add(data.Scan0, y * data.Stride);
+                    System.Runtime.InteropServices.Marshal.Copy(address, row, 0, row.Length);
+                    for (int x = 3; x < row.Length; x += 4)
+                        row[x] = (byte)Math.Max(1, (row[x] * opacity + 127) / 255);
+                    System.Runtime.InteropServices.Marshal.Copy(row, 0, address, row.Length);
+                }
+            }
+            finally { bitmap.UnlockBits(data); }
+        }
+
         private void RenderTaskbarDockedWidget(Graphics g, int w, int h, string titleText)
         {
             bool showSep = _showBigNumber && !string.IsNullOrEmpty(titleText);
@@ -1484,27 +1548,262 @@ namespace WindicatorPlus
             }
         }
 
+        internal struct CardLayoutResult
+        {
+            public Rectangle CardRect;
+            public bool ShowBigNumber;
+            public RectangleF NumAreaRect;
+            public PointF NumDrawPoint;
+            public RectangleF NumGlyphBounds;
+            public bool ShowSeparator;
+            public float SepX;
+            public float SepY1;
+            public float SepY2;
+            public RectangleF ContentAreaRect;
+            public bool HasSubtitle;
+            public PointF TitleDrawPoint;
+            public RectangleF TitleGlyphBounds;
+            public PointF SubDrawPoint;
+            public RectangleF SubGlyphBounds;
+        }
+
+        public static RectangleF MeasureGlyphBounds(string text, Font font, StringFormat sf = null)
+        {
+            if (string.IsNullOrEmpty(text)) return RectangleF.Empty;
+            using (GraphicsPath path = new GraphicsPath())
+            {
+                path.AddString(text, font.FontFamily, (int)font.Style, font.Size, Point.Empty, sf ?? StringFormat.GenericTypographic);
+                return path.GetBounds();
+            }
+        }
+
+        internal static CardLayoutResult CalculateCardLayoutCore(
+            int w,
+            int h,
+            float scale,
+            int currentDesktop,
+            string titleText,
+            string subText,
+            bool showBigNumber,
+            bool showSubtitle,
+            int titleFontSizeLogic)
+        {
+            CardLayoutResult res = new CardLayoutResult();
+            res.CardRect = new Rectangle(4, 4, w - 8, h - 8);
+            res.ShowBigNumber = showBigNumber;
+
+            string numText = currentDesktop.ToString();
+            int numFontSize = Math.Max(12, (int)(48 * scale));
+            int actualTitleFontSize = Math.Max(10, Math.Min(48, titleFontSizeLogic > 0 ? titleFontSizeLogic : 14));
+            int titleFontSize = Math.Max(8, (int)(actualTitleFontSize * scale));
+            int subFontSize = Math.Max(8, (int)(11 * scale));
+
+            using (StringFormat sf = StringFormat.GenericTypographic)
+            using (Font numFont = new Font("Segoe UI Variable Display", numFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (Font titleFont = new Font("Microsoft YaHei UI", titleFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (Font subFont = new Font("Microsoft YaHei UI", subFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
+            {
+                float sepX = 0;
+                if (showBigNumber)
+                {
+                    RectangleF rawNumBounds = MeasureGlyphBounds(numText, numFont, sf);
+                    sepX = (int)((numText.Length > 1 ? 98 : 78) * scale);
+                    if (sepX < res.CardRect.Left + rawNumBounds.Width + 20 * scale)
+                    {
+                        sepX = (float)Math.Ceiling(res.CardRect.Left + rawNumBounds.Width + 20 * scale);
+                    }
+
+                    res.SepX = sepX;
+                    res.SepY1 = (int)(16 * scale);
+                    res.SepY2 = h - (int)(16 * scale);
+                    res.ShowSeparator = true;
+
+                    res.NumAreaRect = new RectangleF(res.CardRect.Left, res.CardRect.Top, sepX - res.CardRect.Left, res.CardRect.Height);
+                    float numCenterX = res.NumAreaRect.X + res.NumAreaRect.Width / 2.0f;
+                    float numCenterY = res.NumAreaRect.Y + res.NumAreaRect.Height / 2.0f;
+
+                    res.NumDrawPoint = new PointF(
+                        numCenterX - (rawNumBounds.X + rawNumBounds.Width / 2.0f),
+                        numCenterY - (rawNumBounds.Y + rawNumBounds.Height / 2.0f));
+
+                    res.NumGlyphBounds = new RectangleF(
+                        res.NumDrawPoint.X + rawNumBounds.X,
+                        res.NumDrawPoint.Y + rawNumBounds.Y,
+                        rawNumBounds.Width,
+                        rawNumBounds.Height);
+                }
+                else
+                {
+                    res.ShowSeparator = false;
+                    res.NumAreaRect = RectangleF.Empty;
+                    res.NumDrawPoint = PointF.Empty;
+                    res.NumGlyphBounds = RectangleF.Empty;
+                }
+
+                // Content Area
+                if (showBigNumber)
+                {
+                    float contentLeft = sepX + 1;
+                    res.ContentAreaRect = new RectangleF(
+                        contentLeft,
+                        res.CardRect.Top,
+                        Math.Max(10f, res.CardRect.Right - contentLeft),
+                        res.CardRect.Height);
+                }
+                else
+                {
+                    res.ContentAreaRect = new RectangleF(
+                        res.CardRect.Left,
+                        res.CardRect.Top,
+                        res.CardRect.Width,
+                        res.CardRect.Height);
+                }
+
+                float contentCenterX = res.ContentAreaRect.X + res.ContentAreaRect.Width / 2.0f;
+                float contentCenterY = res.ContentAreaRect.Y + res.ContentAreaRect.Height / 2.0f;
+
+                bool hasSub = showSubtitle && !string.IsNullOrWhiteSpace(subText);
+                res.HasSubtitle = hasSub;
+
+                RectangleF rawTitleBounds = MeasureGlyphBounds(titleText, titleFont, sf);
+                RectangleF rawSubBounds = hasSub ? MeasureGlyphBounds(subText, subFont, sf) : RectangleF.Empty;
+
+                if (!hasSub)
+                {
+                    if (!string.IsNullOrEmpty(titleText))
+                    {
+                        res.TitleDrawPoint = new PointF(
+                            contentCenterX - (rawTitleBounds.X + rawTitleBounds.Width / 2.0f),
+                            contentCenterY - (rawTitleBounds.Y + rawTitleBounds.Height / 2.0f));
+
+                        res.TitleGlyphBounds = new RectangleF(
+                            res.TitleDrawPoint.X + rawTitleBounds.X,
+                            res.TitleDrawPoint.Y + rawTitleBounds.Y,
+                            rawTitleBounds.Width,
+                            rawTitleBounds.Height);
+                    }
+                    else
+                    {
+                        res.TitleDrawPoint = new PointF(contentCenterX, contentCenterY);
+                        res.TitleGlyphBounds = RectangleF.Empty;
+                    }
+
+                    res.SubDrawPoint = PointF.Empty;
+                    res.SubGlyphBounds = RectangleF.Empty;
+                }
+                else
+                {
+                    float lineGap = Math.Max(3f, (float)Math.Round(5f * scale));
+                    float totalBlockH = rawTitleBounds.Height + lineGap + rawSubBounds.Height;
+                    float blockTop = contentCenterY - totalBlockH / 2.0f;
+
+                    float titleTargetCenterY = blockTop + rawTitleBounds.Height / 2.0f;
+                    float subTargetCenterY = blockTop + rawTitleBounds.Height + lineGap + rawSubBounds.Height / 2.0f;
+
+                    res.TitleDrawPoint = new PointF(
+                        contentCenterX - (rawTitleBounds.X + rawTitleBounds.Width / 2.0f),
+                        titleTargetCenterY - (rawTitleBounds.Y + rawTitleBounds.Height / 2.0f));
+
+                    res.TitleGlyphBounds = new RectangleF(
+                        res.TitleDrawPoint.X + rawTitleBounds.X,
+                        res.TitleDrawPoint.Y + rawTitleBounds.Y,
+                        rawTitleBounds.Width,
+                        rawTitleBounds.Height);
+
+                    res.SubDrawPoint = new PointF(
+                        contentCenterX - (rawSubBounds.X + rawSubBounds.Width / 2.0f),
+                        subTargetCenterY - (rawSubBounds.Y + rawSubBounds.Height / 2.0f));
+
+                    res.SubGlyphBounds = new RectangleF(
+                        res.SubDrawPoint.X + rawSubBounds.X,
+                        res.SubDrawPoint.Y + rawSubBounds.Y,
+                        rawSubBounds.Width,
+                        rawSubBounds.Height);
+                }
+            }
+
+            return res;
+        }
+
+        internal static Size CalculateCardWindowSize(
+            float scale,
+            int currentDesktop,
+            string titleText,
+            string subText,
+            bool showBigNumber,
+            bool showSubtitle,
+            int titleFontSizeLogic)
+        {
+            int baseW = 240;
+            int baseH = 88;
+
+            string numText = currentDesktop.ToString();
+            int numFontSize = Math.Max(12, (int)(48 * scale));
+            int actualTitleFontSize = Math.Max(10, Math.Min(48, titleFontSizeLogic > 0 ? titleFontSizeLogic : 14));
+            int titleFontSize = Math.Max(8, (int)(actualTitleFontSize * scale));
+            int subFontSize = Math.Max(8, (int)(11 * scale));
+
+            using (StringFormat sf = StringFormat.GenericTypographic)
+            using (Font numFont = new Font("Segoe UI Variable Display", numFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (Font titleFont = new Font("Microsoft YaHei UI", titleFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (Font subFont = new Font("Microsoft YaHei UI", subFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
+            {
+                RectangleF rawTitleBounds = MeasureGlyphBounds(titleText, titleFont, sf);
+                bool hasSub = showSubtitle && !string.IsNullOrWhiteSpace(subText);
+                RectangleF rawSubBounds = hasSub ? MeasureGlyphBounds(subText, subFont, sf) : RectangleF.Empty;
+
+                float maxTextW = Math.Max(rawTitleBounds.Width, hasSub ? rawSubBounds.Width : 0);
+                float minW, minH;
+
+                if (showBigNumber)
+                {
+                    RectangleF rawNumBounds = MeasureGlyphBounds(numText, numFont, sf);
+                    float sepX = (int)((numText.Length > 1 ? 98 : 78) * scale);
+                    if (sepX < 4 + rawNumBounds.Width + 20 * scale)
+                    {
+                        sepX = (float)Math.Ceiling(4 + rawNumBounds.Width + 20 * scale);
+                    }
+                    minW = sepX + maxTextW + 36 * scale;
+                    float textH = hasSub ? (rawTitleBounds.Height + Math.Max(4f, 6f * scale) + rawSubBounds.Height) : rawTitleBounds.Height;
+                    minH = Math.Max(rawNumBounds.Height + 28 * scale, textH + 28 * scale);
+                }
+                else
+                {
+                    minW = maxTextW + 48 * scale;
+                    float textH = hasSub ? (rawTitleBounds.Height + Math.Max(4f, 6f * scale) + rawSubBounds.Height) : rawTitleBounds.Height;
+                    minH = textH + 28 * scale;
+                }
+
+                int w = (int)Math.Max(baseW * scale, Math.Ceiling(minW));
+                int h = (int)Math.Max(baseH * scale, Math.Ceiling(minH));
+                return new Size(w, h);
+            }
+        }
+
         private void RenderCardStyle(Graphics g, int w, int h, float scale)
         {
-            Rectangle cardRect = new Rectangle(4, 4, w - 8, h - 8);
-            int radius = (int)(18 * scale);
-
             Color titleColor, subColor, numColor, cardBgColor, borderPenColor;
             GetThemeColors(out titleColor, out subColor, out numColor, out cardBgColor, out borderPenColor);
 
             if (_showBackgroundCard)
             {
-                using (GraphicsPath path = CreateRoundedRectanglePath(cardRect, radius))
+                CardBorderGeometry borderGeo = CalculateCardBorderGeometry(w, h, scale);
+                PixelOffsetMode oldPom = g.PixelOffsetMode;
+                try
                 {
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    using (GraphicsPath outerPath = CreateRoundedRectanglePath(borderGeo.OuterRect, borderGeo.OuterRadius))
                     using (SolidBrush bgBrush = new SolidBrush(cardBgColor))
                     {
-                        g.FillPath(bgBrush, path);
-                    }
-                    using (Pen borderPen = new Pen(borderPenColor, 1.2f))
-                    {
-                        g.DrawPath(borderPen, path);
+                        g.FillPath(bgBrush, outerPath);
                     }
                 }
+                finally
+                {
+                    g.PixelOffsetMode = oldPom;
+                }
+
+                RenderCardBorderRing(g, w, h, borderGeo, borderPenColor);
             }
 
             string numText = _currentDesktop.ToString();
@@ -1516,53 +1815,71 @@ namespace WindicatorPlus
                 subText = _isSnapped ? "🧲 已吸附" : "✋ 按住左键自由拖动";
             }
 
-            int numFontSize = (int)(48 * scale);
-            int titleFontSize = (int)(14 * scale);
-            int subFontSize = (int)(11 * scale);
+            CardLayoutResult layout = CalculateCardLayoutCore(
+                w,
+                h,
+                scale,
+                _currentDesktop,
+                titleText,
+                subText,
+                _showBigNumber,
+                _showSubtitle,
+                _titleFontSize);
 
+            int numFontSize = Math.Max(12, (int)(48 * scale));
+            int actualTitleFontSize = Math.Max(10, Math.Min(48, _titleFontSize > 0 ? _titleFontSize : 14));
+            int titleFontSize = Math.Max(8, (int)(actualTitleFontSize * scale));
+            int subFontSize = Math.Max(8, (int)(11 * scale));
+
+            using (StringFormat sf = StringFormat.GenericTypographic)
             using (Font numFont = new Font("Segoe UI Variable Display", numFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
             using (Font titleFont = new Font("Microsoft YaHei UI", titleFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
             using (Font subFont = new Font("Microsoft YaHei UI", subFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
             {
-                int textX = (int)(20 * scale);
-
-                if (_showBigNumber)
+                if (layout.ShowBigNumber)
                 {
                     using (SolidBrush shadow = new SolidBrush(Color.FromArgb(220, 0, 0, 0)))
                     {
-                        g.DrawString(numText, numFont, shadow, new PointF(textX + 2, (int)(14 * scale) + 1));
+                        g.DrawString(numText, numFont, shadow, new PointF(layout.NumDrawPoint.X + 2, layout.NumDrawPoint.Y + 1), sf);
                     }
                     using (SolidBrush white = new SolidBrush(numColor))
                     {
-                        g.DrawString(numText, numFont, white, new PointF(textX, (int)(14 * scale)));
+                        g.DrawString(numText, numFont, white, layout.NumDrawPoint, sf);
                     }
 
-                    int sepX = (int)((numText.Length > 1 ? 98 : 78) * scale);
-                    using (Pen sepPen = new Pen(Color.FromArgb(120, 255, 255, 255), 1.2f))
+                    if (layout.ShowSeparator)
                     {
-                        g.DrawLine(sepPen, sepX, (int)(16 * scale), sepX, h - (int)(16 * scale));
+                        using (Pen sepPen = new Pen(Color.FromArgb(120, 255, 255, 255), 1.2f))
+                        {
+                            g.DrawLine(sepPen, layout.SepX, layout.SepY1, layout.SepX, layout.SepY2);
+                        }
                     }
-                    textX = sepX + (int)(14 * scale);
                 }
 
                 // High Contrast Title
-                using (SolidBrush titleShadow = new SolidBrush(Color.FromArgb(220, 0, 0, 0)))
-                using (SolidBrush titleBrush = new SolidBrush(titleColor))
+                if (!string.IsNullOrEmpty(titleText))
                 {
-                    g.DrawString(titleText, titleFont, titleShadow, new PointF(textX + 1, (int)(18 * scale) + 1));
-                    g.DrawString(titleText, titleFont, titleBrush, new PointF(textX, (int)(18 * scale)));
+                    using (SolidBrush titleShadow = new SolidBrush(Color.FromArgb(220, 0, 0, 0)))
+                    using (SolidBrush titleBrush = new SolidBrush(titleColor))
+                    {
+                        g.DrawString(titleText, titleFont, titleShadow, new PointF(layout.TitleDrawPoint.X + 1, layout.TitleDrawPoint.Y + 1), sf);
+                        g.DrawString(titleText, titleFont, titleBrush, layout.TitleDrawPoint, sf);
+                    }
                 }
 
                 // High Contrast Subtitle
-                Color displaySubColor = _isInteractive
-                    ? (_isSnapped ? Color.FromArgb(52, 211, 153) : Color.FromArgb(192, 132, 252))
-                    : subColor;
-
-                using (SolidBrush subShadow = new SolidBrush(Color.FromArgb(200, 0, 0, 0)))
-                using (SolidBrush subBrush = new SolidBrush(displaySubColor))
+                if (layout.HasSubtitle && !string.IsNullOrEmpty(subText))
                 {
-                    g.DrawString(subText, subFont, subShadow, new PointF(textX + 1, (int)(46 * scale) + 1));
-                    g.DrawString(subText, subFont, subBrush, new PointF(textX, (int)(46 * scale)));
+                    Color displaySubColor = _isInteractive
+                        ? (_isSnapped ? Color.FromArgb(52, 211, 153) : Color.FromArgb(192, 132, 252))
+                        : subColor;
+
+                    using (SolidBrush subShadow = new SolidBrush(Color.FromArgb(200, 0, 0, 0)))
+                    using (SolidBrush subBrush = new SolidBrush(displaySubColor))
+                    {
+                        g.DrawString(subText, subFont, subShadow, new PointF(layout.SubDrawPoint.X + 1, layout.SubDrawPoint.Y + 1), sf);
+                        g.DrawString(subText, subFont, subBrush, layout.SubDrawPoint, sf);
+                    }
                 }
             }
         }
@@ -1676,27 +1993,333 @@ namespace WindicatorPlus
                 subtitle = _isSnapped ? "🧲 已吸附" : "✋ 按住左键自由拖动";
             }
 
-            using (Font titleFont = new Font("Microsoft YaHei UI", (int)(19 * scale), FontStyle.Bold, GraphicsUnit.Pixel))
-            using (Font subFont = new Font("Microsoft YaHei UI", (int)(11 * scale), FontStyle.Bold, GraphicsUnit.Pixel))
+            int actualTitleFontSize = Math.Max(10, Math.Min(48, _titleFontSize > 0 ? _titleFontSize : 14));
+            int titleFontSize = Math.Max(8, (int)(actualTitleFontSize * scale));
+            int subFontSize = Math.Max(8, (int)(11 * scale));
+            bool hasSub = _showSubtitle && !string.IsNullOrWhiteSpace(subtitle);
+
+            using (StringFormat sf = StringFormat.GenericTypographic)
+            using (Font titleFont = new Font("Microsoft YaHei UI", titleFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (Font subFont = new Font("Microsoft YaHei UI", subFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
             {
-                using (SolidBrush shadow = new SolidBrush(Color.FromArgb(220, 0, 0, 0)))
+                float contentCenterX = cardRect.X + cardRect.Width / 2.0f;
+                float contentCenterY = cardRect.Y + cardRect.Height / 2.0f;
+
+                RectangleF titleBounds = MeasureGlyphBounds(title, titleFont, sf);
+                RectangleF subBounds = hasSub ? MeasureGlyphBounds(subtitle, subFont, sf) : RectangleF.Empty;
+
+                PointF titleDrawPoint;
+                PointF subDrawPoint = PointF.Empty;
+
+                if (!hasSub)
                 {
-                    g.DrawString(title, titleFont, shadow, new PointF((int)(20 * scale), (int)(14 * scale)));
+                    titleDrawPoint = new PointF(
+                        contentCenterX - (titleBounds.X + titleBounds.Width / 2.0f),
+                        contentCenterY - (titleBounds.Y + titleBounds.Height / 2.0f));
                 }
-                using (SolidBrush textBrush = new SolidBrush(titleColor))
+                else
                 {
-                    g.DrawString(title, titleFont, textBrush, new PointF((int)(18 * scale), (int)(12 * scale)));
+                    float gap = Math.Max(3f, (float)Math.Round(5f * scale));
+                    float totalH = titleBounds.Height + gap + subBounds.Height;
+                    float blockTop = contentCenterY - totalH / 2.0f;
+
+                    float titleTargetY = blockTop + titleBounds.Height / 2.0f;
+                    float subTargetY = blockTop + titleBounds.Height + gap + subBounds.Height / 2.0f;
+
+                    titleDrawPoint = new PointF(
+                        contentCenterX - (titleBounds.X + titleBounds.Width / 2.0f),
+                        titleTargetY - (titleBounds.Y + titleBounds.Height / 2.0f));
+
+                    subDrawPoint = new PointF(
+                        contentCenterX - (subBounds.X + subBounds.Width / 2.0f),
+                        subTargetY - (subBounds.Y + subBounds.Height / 2.0f));
                 }
 
-                Color displaySubColor = _isInteractive
-                    ? (_isSnapped ? Color.FromArgb(52, 211, 153) : Color.FromArgb(192, 132, 252))
-                    : subColor;
-
-                using (SolidBrush subBrush = new SolidBrush(displaySubColor))
+                if (!string.IsNullOrEmpty(title))
                 {
-                    g.DrawString(subtitle, subFont, subBrush, new PointF((int)(19 * scale), (int)(46 * scale)));
+                    using (SolidBrush shadow = new SolidBrush(Color.FromArgb(220, 0, 0, 0)))
+                    using (SolidBrush textBrush = new SolidBrush(titleColor))
+                    {
+                        g.DrawString(title, titleFont, shadow, new PointF(titleDrawPoint.X + 1, titleDrawPoint.Y + 1), sf);
+                        g.DrawString(title, titleFont, textBrush, titleDrawPoint, sf);
+                    }
+                }
+
+                if (hasSub && !string.IsNullOrEmpty(subtitle))
+                {
+                    Color displaySubColor = _isInteractive
+                        ? (_isSnapped ? Color.FromArgb(52, 211, 153) : Color.FromArgb(192, 132, 252))
+                        : subColor;
+
+                    using (SolidBrush subBrush = new SolidBrush(displaySubColor))
+                    {
+                        g.DrawString(subtitle, subFont, subBrush, subDrawPoint, sf);
+                    }
                 }
             }
+        }
+
+        internal struct CardBorderGeometry
+        {
+            public RectangleF OuterRect;
+            public RectangleF InnerRect;
+            public float OuterRadius;
+            public float InnerRadius;
+            public float Thickness;
+            public PointF TopLeftOuterCenter;
+            public PointF TopLeftInnerCenter;
+            public PointF TopRightOuterCenter;
+            public PointF TopRightInnerCenter;
+            public PointF BottomRightOuterCenter;
+            public PointF BottomRightInnerCenter;
+            public PointF BottomLeftOuterCenter;
+            public PointF BottomLeftInnerCenter;
+        }
+
+        internal static CardBorderGeometry CalculateCardBorderGeometry(int w, int h, float scale)
+        {
+            float thickness = 2.4f * scale;
+            RectangleF outerRect = new RectangleF(4f, 4f, (float)(w - 8), (float)(h - 8));
+            float outerRadius = 18f * scale;
+
+            float innerX = outerRect.X + thickness;
+            float innerY = outerRect.Y + thickness;
+            float innerW = Math.Max(0f, outerRect.Width - 2f * thickness);
+            float innerH = Math.Max(0f, outerRect.Height - 2f * thickness);
+            float innerRadius = Math.Max(0f, outerRadius - thickness);
+            RectangleF innerRect = new RectangleF(innerX, innerY, innerW, innerH);
+
+            CardBorderGeometry geo = new CardBorderGeometry();
+            geo.OuterRect = outerRect;
+            geo.InnerRect = innerRect;
+            geo.OuterRadius = outerRadius;
+            geo.InnerRadius = innerRadius;
+            geo.Thickness = thickness;
+
+            geo.TopLeftOuterCenter = new PointF(outerRect.X + outerRadius, outerRect.Y + outerRadius);
+            geo.TopLeftInnerCenter = new PointF(innerRect.X + innerRadius, innerRect.Y + innerRadius);
+
+            geo.TopRightOuterCenter = new PointF(outerRect.Right - outerRadius, outerRect.Y + outerRadius);
+            geo.TopRightInnerCenter = new PointF(innerRect.Right - innerRadius, innerRect.Y + innerRadius);
+
+            geo.BottomRightOuterCenter = new PointF(outerRect.Right - outerRadius, outerRect.Bottom - outerRadius);
+            geo.BottomRightInnerCenter = new PointF(innerRect.Right - innerRadius, innerRect.Bottom - innerRadius);
+
+            geo.BottomLeftOuterCenter = new PointF(outerRect.X + outerRadius, outerRect.Bottom - outerRadius);
+            geo.BottomLeftInnerCenter = new PointF(innerRect.X + innerRadius, innerRect.Bottom - innerRadius);
+
+            return geo;
+        }
+
+        internal static void AddRoundedRectangleToPath(GraphicsPath path, RectangleF rect, float radius)
+        {
+            if (rect.Width <= 0 || rect.Height <= 0) return;
+
+            float maxRadius = Math.Min(rect.Width / 2f, rect.Height / 2f);
+            float r = Math.Min(radius, maxRadius);
+
+            if (r <= 0.05f)
+            {
+                path.AddRectangle(rect);
+                path.CloseFigure();
+                return;
+            }
+
+            float d = r * 2f;
+            path.AddArc(rect.X, rect.Y, d, d, 180f, 90f);
+            path.AddArc(rect.Right - d, rect.Y, d, d, 270f, 90f);
+            path.AddArc(rect.Right - d, rect.Bottom - d, d, d, 0f, 90f);
+            path.AddArc(rect.X, rect.Bottom - d, d, d, 90f, 90f);
+            path.CloseFigure();
+        }
+
+        internal static GraphicsPath CreateRoundedRectanglePath(RectangleF rect, float radius)
+        {
+            GraphicsPath path = new GraphicsPath();
+            AddRoundedRectangleToPath(path, rect, radius);
+            return path;
+        }
+
+        internal static GraphicsPath CreateRoundedRectangleRingPath(RectangleF outerRect, float outerRadius, float thickness)
+        {
+            GraphicsPath path = new GraphicsPath();
+            path.FillMode = FillMode.Alternate;
+            AddRoundedRectangleToPath(path, outerRect, outerRadius);
+
+            float innerX = outerRect.X + thickness;
+            float innerY = outerRect.Y + thickness;
+            float innerW = Math.Max(0f, outerRect.Width - 2f * thickness);
+            float innerH = Math.Max(0f, outerRect.Height - 2f * thickness);
+            float innerRadius = Math.Max(0f, outerRadius - thickness);
+
+            RectangleF innerRect = new RectangleF(innerX, innerY, innerW, innerH);
+            AddRoundedRectangleToPath(path, innerRect, innerRadius);
+
+            return path;
+        }
+
+        internal static void RenderCardBorderRing(Graphics g, int w, int h, CardBorderGeometry borderGeo, Color borderPenColor)
+        {
+            using (Bitmap borderBmp = CreateSymmetricBorderBitmap(w, h, borderGeo.OuterRect, borderGeo.OuterRadius, borderGeo.Thickness, borderPenColor))
+            {
+                InterpolationMode oldIm = g.InterpolationMode;
+                PixelOffsetMode oldPom = g.PixelOffsetMode;
+                CompositingMode oldCm = g.CompositingMode;
+                CompositingQuality oldCq = g.CompositingQuality;
+                try
+                {
+                    g.InterpolationMode = InterpolationMode.NearestNeighbor;
+                    g.PixelOffsetMode = PixelOffsetMode.None;
+                    g.CompositingMode = CompositingMode.SourceOver;
+                    g.CompositingQuality = CompositingQuality.HighQuality;
+                    borderBmp.SetResolution(g.DpiX, g.DpiY);
+                    g.DrawImage(borderBmp, new Rectangle(0, 0, w, h), 0, 0, w, h, GraphicsUnit.Pixel);
+                }
+                finally
+                {
+                    g.InterpolationMode = oldIm;
+                    g.PixelOffsetMode = oldPom;
+                    g.CompositingMode = oldCm;
+                    g.CompositingQuality = oldCq;
+                }
+            }
+        }
+
+        internal static Bitmap CreateSymmetricBorderBitmap(int w, int h, RectangleF outerRect, float outerRadius, float thickness, Color borderPenColor)
+        {
+            Bitmap bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+            BitmapData data = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+            int stride = data.Stride;
+            byte[] buffer = new byte[stride * h];
+
+            float cx = outerRect.X + outerRect.Width / 2f;
+            float cy = outerRect.Y + outerRect.Height / 2f;
+            float hw = outerRect.Width / 2f;
+            float hh = outerRect.Height / 2f;
+            float hw_in = hw - thickness;
+            float hh_in = hh - thickness;
+            float innerRadius = Math.Max(0f, outerRadius - thickness);
+            float qx = hw - outerRadius;
+            float qy = hh - outerRadius;
+            float r_out_sq = outerRadius * outerRadius;
+            float r_in_sq = innerRadius * innerRadius;
+
+            int N = 8;
+            float subStep = 1.0f / N;
+            float halfSub = 0.5f / N;
+            float invTotal = 1.0f / (N * N);
+
+            byte baseA = borderPenColor.A;
+            byte baseR = borderPenColor.R;
+            byte baseG = borderPenColor.G;
+            byte baseB = borderPenColor.B;
+
+            for (int y = 0; y < h; y++)
+            {
+                int rowOffset = y * stride;
+                for (int x = 0; x < w; x++)
+                {
+                    float minDx = (x <= cx && cx <= x + 1f) ? 0f : Math.Min(Math.Abs(x - cx), Math.Abs(x + 1f - cx));
+                    float maxDx = Math.Max(Math.Abs(x - cx), Math.Abs(x + 1f - cx));
+                    float minDy = (y <= cy && cy <= y + 1f) ? 0f : Math.Min(Math.Abs(y - cy), Math.Abs(y + 1f - cy));
+                    float maxDy = Math.Max(Math.Abs(y - cy), Math.Abs(y + 1f - cy));
+
+                    if (minDx > hw || minDy > hh) continue;
+                    if (minDx > qx && minDy > qy)
+                    {
+                        float ex = minDx - qx;
+                        float ey = minDy - qy;
+                        if (ex * ex + ey * ey > r_out_sq) continue;
+                    }
+
+                    if (maxDx <= hw_in && maxDy <= hh_in)
+                    {
+                        if (maxDx <= qx || maxDy <= qy) continue;
+                        float ex = maxDx - qx;
+                        float ey = maxDy - qy;
+                        if (ex * ex + ey * ey <= r_in_sq) continue;
+                    }
+
+                    bool fullyInOuter = (maxDx <= hw && maxDy <= hh);
+                    if (fullyInOuter && maxDx > qx && maxDy > qy)
+                    {
+                        float ex = maxDx - qx;
+                        float ey = maxDy - qy;
+                        fullyInOuter = (ex * ex + ey * ey <= r_out_sq);
+                    }
+
+                    bool fullyOutInner = (minDx > hw_in || minDy > hh_in);
+                    if (!fullyOutInner && minDx > qx && minDy > qy)
+                    {
+                        float ex = minDx - qx;
+                        float ey = minDy - qy;
+                        fullyOutInner = (ex * ex + ey * ey > r_in_sq);
+                    }
+
+                    int pxOffset = rowOffset + x * 4;
+                    if (fullyInOuter && fullyOutInner)
+                    {
+                        buffer[pxOffset] = baseB;
+                        buffer[pxOffset + 1] = baseG;
+                        buffer[pxOffset + 2] = baseR;
+                        buffer[pxOffset + 3] = baseA;
+                        continue;
+                    }
+
+                    int hits = 0;
+                    for (int sy = 0; sy < N; sy++)
+                    {
+                        float py = y + sy * subStep + halfSub;
+                        float dy = Math.Abs(py - cy);
+                        if (dy > hh) continue;
+
+                        for (int sx = 0; sx < N; sx++)
+                        {
+                            float px = x + sx * subStep + halfSub;
+                            float dx = Math.Abs(px - cx);
+                            if (dx > hw) continue;
+
+                            bool inOut;
+                            if (dx <= qx || dy <= qy) inOut = true;
+                            else
+                            {
+                                float ex = dx - qx;
+                                float ey = dy - qy;
+                                inOut = (ex * ex + ey * ey <= r_out_sq);
+                            }
+                            if (!inOut) continue;
+
+                            bool inIn;
+                            if (dx > hw_in || dy > hh_in) inIn = false;
+                            else if (dx <= qx || dy <= qy) inIn = true;
+                            else
+                            {
+                                float ex = dx - qx;
+                                float ey = dy - qy;
+                                inIn = (ex * ex + ey * ey <= r_in_sq);
+                            }
+                            if (!inIn) hits++;
+                        }
+                    }
+
+                    if (hits > 0)
+                    {
+                        float coverage = hits * invTotal;
+                        byte alpha = (byte)Math.Round(baseA * coverage);
+                        if (alpha > 0)
+                        {
+                            buffer[pxOffset] = baseB;
+                            buffer[pxOffset + 1] = baseG;
+                            buffer[pxOffset + 2] = baseR;
+                            buffer[pxOffset + 3] = alpha;
+                        }
+                    }
+                }
+            }
+
+            Marshal.Copy(buffer, 0, data.Scan0, buffer.Length);
+            bmp.UnlockBits(data);
+            return bmp;
         }
 
         private GraphicsPath CreateRoundedRectanglePath(Rectangle rect, int radius)
@@ -1726,6 +2349,11 @@ namespace WindicatorPlus
                 {
                     _monitorThread.Join(200);
                     _monitorThread = null;
+                }
+                if (LastRenderedBitmapForTest != null)
+                {
+                    try { LastRenderedBitmapForTest.Dispose(); } catch { }
+                    LastRenderedBitmapForTest = null;
                 }
                 SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
             }

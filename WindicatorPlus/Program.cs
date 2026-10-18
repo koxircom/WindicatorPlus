@@ -3,10 +3,20 @@ using System.Diagnostics;
 using System.Threading;
 using System.Windows.Forms;
 
+[assembly: System.Reflection.AssemblyVersion("1.4.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.4.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.4.0-preview.1")]
+
 namespace WindicatorPlus
 {
     static class Program
     {
+        private static bool HasArgument(string[] args, string value)
+        {
+            foreach (string arg in args) if (string.Equals(arg, value, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
         private const string MUTEX_NAME = @"Global\WindicatorPlus_SingleInstance_Mutex_987213";
         private static Mutex _appMutex;
 
@@ -26,9 +36,10 @@ namespace WindicatorPlus
                 try { NativeMethods.SetProcessDpiAwareness(NativeMethods.PROCESS_PER_MONITOR_DPI_AWARE); } catch { }
             }
 
-            // Single instance check
+            bool independent = HasArgument(args, "--independesk");
+            // Independent companion has its own mutex: it never terminates the installed native mode.
             bool createdNew;
-            _appMutex = new Mutex(true, MUTEX_NAME, out createdNew);
+            _appMutex = new Mutex(true, independent ? @"Local\WindicatorPlus_IndepenDesk_v1" : MUTEX_NAME, out createdNew);
 
             if (!createdNew)
             {
@@ -46,6 +57,13 @@ namespace WindicatorPlus
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+
+            if (independent)
+            {
+                try { using (var context = new IndependentDesktopContext()) Application.Run(context); }
+                finally { _appMutex.ReleaseMutex(); _appMutex.Close(); }
+                return;
+            }
 
             AppConfig config = ConfigManager.Load();
 
