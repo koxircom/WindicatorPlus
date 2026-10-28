@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2011%20%7C%20Windows%2010-informational.svg)](README.md)
-[![Release](https://img.shields.io/badge/Release-v1.3.12-success.svg)](https://github.com/koxircom/WindicatorPlus/releases)
+[![Release](https://img.shields.io/badge/Release-v1.3.13-success.svg)](https://github.com/koxircom/WindicatorPlus/releases)
 
 **Windicator+** 是专为 Windows 11 / 10 深度优化的原生 C#/.NET 虚拟桌面任务栏吸附式指示器。
 
@@ -48,8 +48,8 @@ build.bat
 
 ## 📦 快速下载
 
-前往 [GitHub Releases](https://github.com/koxircom/WindicatorPlus/releases/tag/v1.3.12) 下载预编译的便携式绿色压缩包：
-- `WindicatorPlus-v1.3.12-Portable.zip`：解压即用，配置自动保存在 `%APPDATA%\WindicatorPlus\config.ini`。
+前往 [GitHub Releases](https://github.com/koxircom/WindicatorPlus/releases/tag/v1.3.13) 下载预编译的便携式绿色压缩包：
+- `WindicatorPlus-v1.3.13-Portable.zip`：解压即用，配置自动保存在 `%APPDATA%\WindicatorPlus\config.ini`。
 
 ---
 

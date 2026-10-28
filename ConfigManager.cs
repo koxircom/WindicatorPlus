@@ -54,7 +54,7 @@ namespace WindicatorPlus
             WatermarkEnabled = true;
             WatermarkOpacity = 40; // 默认 40% 显目高透
             WatermarkStyle = "Card";
-            WatermarkPosition = "BottomRight";
+            WatermarkPosition = "Taskbar"; // 默认任务栏智能吸附（Windows 11 / 10 最佳原生体验）
             CustomX = -1;
             CustomY = -1;
             DragModifierKey = "Control";

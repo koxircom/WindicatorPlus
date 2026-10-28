@@ -6,11 +6,11 @@ set "ROOT_DIR=%~dp0"
 if defined WINDICATOR_BUILD_OUT (
     set "OUT_DIR=%WINDICATOR_BUILD_OUT%"
 ) else (
-    set "OUT_DIR=%ROOT_DIR%out\v1.3.12"
+    set "OUT_DIR=%ROOT_DIR%out\v1.3.13"
 )
 if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
 
-echo [Windicator+] 正在使用系统内置 .NET Framework 编译器构建 WindicatorPlus.exe (v1.3.12 候选构建)...
+echo [Windicator+] 正在使用系统内置 .NET Framework 编译器构建 WindicatorPlus.exe (v1.3.13 候选构建)...
 
 set "CSC_PATH=%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 if not exist "%CSC_PATH%" (
@@ -31,12 +31,12 @@ if errorlevel 1 exit /b 1
 
 if %ERRORLEVEL% equ 0 (
     echo [成功] WindicatorPlus.exe 编译成功: %OUT_DIR%\WindicatorPlus.exe
-    copy /y "%OUT_DIR%\WindicatorPlus.exe" "%OUT_DIR%\WindicatorPlus-v1.3.12.exe" >nul
+    copy /y "%OUT_DIR%\WindicatorPlus.exe" "%OUT_DIR%\WindicatorPlus-v1.3.13.exe" >nul
     if errorlevel 1 (
-        echo [失败] 复制 WindicatorPlus-v1.3.12.exe 出错
+        echo [失败] 复制 WindicatorPlus-v1.3.13.exe 出错
         exit /b 1
     )
-    echo [成功] 已生成带版本可执行程序: %OUT_DIR%\WindicatorPlus-v1.3.12.exe
+    echo [成功] 已生成带版本可执行程序: %OUT_DIR%\WindicatorPlus-v1.3.13.exe
     exit /b 0
 ) else (
     echo [失败] 编译出错，退出码: %ERRORLEVEL%

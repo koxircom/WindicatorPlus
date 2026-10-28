@@ -180,7 +180,26 @@ namespace WindicatorPlus
 
                 // Stage 1: Find Chevron (优先从 hTray shallow 查找，未命中再从 taskbarElem 查找，两者同预算)
                 currentStage = "FindChevron";
+                // 1.1 针对 Windows 10: TrayNotifyWnd 内部直接含有 Win32 原生 "Button" 窗口
                 if (hTray != IntPtr.Zero)
+                {
+                    IntPtr hWin10Btn = NativeMethods.FindWindowEx(hTray, IntPtr.Zero, "Button", null);
+                    if (hWin10Btn != IntPtr.Zero && NativeMethods.IsWindowVisible(hWin10Btn))
+                    {
+                        NativeMethods.RECT rcBtn;
+                        if (NativeMethods.GetWindowRect(hWin10Btn, out rcBtn))
+                        {
+                            int bw = rcBtn.Right - rcBtn.Left;
+                            int bh = rcBtn.Bottom - rcBtn.Top;
+                            if (bw > 0 && bh > 0)
+                            {
+                                observedChevronRect = new Rectangle(rcBtn.Left, rcBtn.Top, bw, bh);
+                            }
+                        }
+                    }
+                }
+
+                if (observedChevronRect.IsEmpty && hTray != IntPtr.Zero)
                 {
                     IUIAutomationElement trayElem = tracker.Track(_uia.ElementFromHandle(hTray));
                     if (trayElem != null)
@@ -196,9 +215,36 @@ namespace WindicatorPlus
                 }
                 CheckBudget(probeStopwatch, "FindChevronCompleted");
 
-                // Stage 2: Find TaskbarFrame / TaskbarFrameRepeater
+                // Stage 2: Find TaskbarFrame / TaskbarFrameRepeater (Win11) 或 MSTaskListWClass (Win10)
                 currentStage = "FindRepeater";
-                IUIAutomationElement targetContainer = FindTaskbarFrameRepeaterInternal(taskbarElem, walker, tracker, probeStopwatch);
+                IUIAutomationElement targetContainer = null;
+                IntPtr hWin10TaskList = IntPtr.Zero;
+
+                // 2.1 探测 Windows 10 原生任务栏应用列表窗口 (MSTaskListWClass)
+                IntPtr hReBar = NativeMethods.FindWindowEx(hTaskbar, IntPtr.Zero, "ReBarWindow32", null);
+                if (hReBar != IntPtr.Zero)
+                {
+                    IntPtr hTaskSw = NativeMethods.FindWindowEx(hReBar, IntPtr.Zero, "MSTaskSwWClass", null);
+                    if (hTaskSw != IntPtr.Zero)
+                    {
+                        hWin10TaskList = NativeMethods.FindWindowEx(hTaskSw, IntPtr.Zero, "MSTaskListWClass", null);
+                    }
+                }
+                if (hWin10TaskList == IntPtr.Zero)
+                {
+                    hWin10TaskList = NativeMethods.FindWindowEx(hTaskbar, IntPtr.Zero, "MSTaskListWClass", null);
+                }
+
+                if (hWin10TaskList != IntPtr.Zero)
+                {
+                    targetContainer = tracker.Track(_uia.ElementFromHandle(hWin10TaskList));
+                }
+
+                // 2.2 若非 Win10，则走 Windows 11 的 XAML TaskbarFrameRepeater / TaskbarFrame
+                if (targetContainer == null)
+                {
+                    targetContainer = FindTaskbarFrameRepeaterInternal(taskbarElem, walker, tracker, probeStopwatch);
+                }
                 CheckBudget(probeStopwatch, "FindRepeaterCompleted");
 
                 // Stage 3 & 4: Enumerate buttons with FindAllBuildCache
@@ -227,6 +273,20 @@ namespace WindicatorPlus
                                 validButtonsCount++;
                             }
                             currentStage = "EnumerateButtons";
+                        }
+                    }
+                }
+
+                // 4.1 针对 Windows 10 的安全回退保障：若未单独枚举到子按钮但 Win10 任务栏存在，使用其物理右边界
+                if (validButtonsCount == 0 && hWin10TaskList != IntPtr.Zero)
+                {
+                    NativeMethods.RECT rcTaskList;
+                    if (NativeMethods.GetWindowRect(hWin10TaskList, out rcTaskList))
+                    {
+                        if (rcTaskList.Right > 0 && rcTaskList.Right <= trayLeft)
+                        {
+                            maxAppRight = rcTaskList.Right;
+                            validButtonsCount = 1;
                         }
                     }
                 }

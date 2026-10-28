@@ -3,9 +3,9 @@ using System.Diagnostics;
 using System.Threading;
 using System.Windows.Forms;
 
-[assembly: System.Reflection.AssemblyVersion("1.3.12.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.3.12.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.3.12")]
+[assembly: System.Reflection.AssemblyVersion("1.3.13.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.3.13.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.3.13")]
 
 namespace WindicatorPlus
 {
@@ -44,7 +44,7 @@ namespace WindicatorPlus
                 return;
             }
 
-            RuntimeTrace.LogAppStart(Process.GetCurrentProcess().Id, "1.3.12");
+            RuntimeTrace.LogAppStart(Process.GetCurrentProcess().Id, "1.3.13");
 
             Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
             Application.ThreadException += (s, e) => { };
@@ -95,9 +95,6 @@ namespace WindicatorPlus
 
             // Start background registry monitoring
             watcher.Start();
-
-            // Prewarm settings form in background (Instant 0ms open, zero flicker)
-            trayManager.PrewarmSettingsForm();
 
             // Handle clean exit
             trayManager.ExitRequested += () =>

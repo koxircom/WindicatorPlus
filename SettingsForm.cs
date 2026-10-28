@@ -10,7 +10,7 @@ namespace WindicatorPlus
 {
     public class SettingsForm : Form
     {
-        public const string CURRENT_VERSION = "v1.3.12";
+        public const string CURRENT_VERSION = "v1.3.13";
 
 
         private AppConfig _config;
@@ -358,7 +358,6 @@ namespace WindicatorPlus
                 scroller.Controls.Add(view);
                 _pageScrollers.Add(view, scroller);
                 _pageHost.Controls.Add(scroller);
-                WarmUpControlTree(scroller);
             }
             SwitchTab("General");
 
@@ -388,13 +387,7 @@ namespace WindicatorPlus
 
         private void WarmUpControlTree(Control c)
         {
-            if (c == null) return;
-            c.CreateControl();
-            IntPtr h = c.Handle;
-            foreach (Control child in c.Controls)
-            {
-                WarmUpControlTree(child);
-            }
+            // Windows 10 优化：彻底移除预热递归创建控件句柄，杜绝子控件未展示前意外独立渲染
         }
 
         protected override void OnHandleCreated(EventArgs e)

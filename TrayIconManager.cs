@@ -698,12 +698,7 @@ namespace WindicatorPlus
 
         public void PrewarmSettingsForm()
         {
-            if (_settingsForm == null || _settingsForm.IsDisposed)
-            {
-                _settingsForm = new SettingsForm(_config, _watermark, this, _watcher);
-                _settingsForm.CreateControl();
-                IntPtr h = _settingsForm.Handle;
-            }
+            // Windows 10 优化：彻底移除预热实例化，完全按需懒加载，杜绝未显示的子控件句柄泄漏至桌面
         }
 
         public void OpenSettingsForm()
