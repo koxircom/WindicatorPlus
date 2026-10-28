@@ -45,6 +45,101 @@ namespace WindicatorPlus
         }
     }
 
+    internal enum TaskbarProbeStatus
+    {
+        Success,
+        TransientFailure,
+        PermanentFailure
+    }
+
+    internal class TaskbarProbeResult
+    {
+        public TaskbarProbeStatus Status { get; private set; }
+        public TaskbarSpaceSnapshot Snapshot { get; private set; }
+        public string Stage { get; private set; }
+        public string ExceptionDetail { get; private set; }
+        public Rectangle NativeTrayRect { get; private set; }
+        public Rectangle ObservedChevronRect { get; private set; }
+        public Rectangle EffectiveTrayRect { get; private set; }
+        public int MaxAppRight { get; private set; }
+
+        private TaskbarProbeResult(
+            TaskbarProbeStatus status,
+            TaskbarSpaceSnapshot snapshot,
+            string stage,
+            string exceptionDetail,
+            Rectangle nativeTrayRect,
+            Rectangle observedChevronRect,
+            Rectangle effectiveTrayRect,
+            int maxAppRight)
+        {
+            Status = status;
+            Snapshot = snapshot ?? TaskbarSpaceSnapshot.Invalid();
+            Stage = stage ?? "";
+            ExceptionDetail = exceptionDetail ?? "";
+            NativeTrayRect = nativeTrayRect;
+            ObservedChevronRect = observedChevronRect;
+            EffectiveTrayRect = effectiveTrayRect;
+            MaxAppRight = maxAppRight;
+        }
+
+        public static TaskbarProbeResult Success(
+            TaskbarSpaceSnapshot snapshot,
+            Rectangle nativeTrayRect,
+            Rectangle observedChevronRect,
+            Rectangle effectiveTrayRect,
+            int maxAppRight)
+        {
+            return new TaskbarProbeResult(
+                TaskbarProbeStatus.Success,
+                snapshot,
+                "",
+                "",
+                nativeTrayRect,
+                observedChevronRect,
+                effectiveTrayRect,
+                maxAppRight);
+        }
+
+        public static TaskbarProbeResult Transient(
+            string stage,
+            string exceptionDetail,
+            Rectangle nativeTrayRect,
+            Rectangle observedChevronRect,
+            Rectangle effectiveTrayRect,
+            int maxAppRight)
+        {
+            return new TaskbarProbeResult(
+                TaskbarProbeStatus.TransientFailure,
+                TaskbarSpaceSnapshot.Invalid(),
+                stage,
+                exceptionDetail,
+                nativeTrayRect,
+                observedChevronRect,
+                effectiveTrayRect,
+                maxAppRight);
+        }
+
+        public static TaskbarProbeResult Permanent(
+            string stage,
+            string exceptionDetail,
+            Rectangle nativeTrayRect,
+            Rectangle observedChevronRect,
+            Rectangle effectiveTrayRect,
+            int maxAppRight)
+        {
+            return new TaskbarProbeResult(
+                TaskbarProbeStatus.PermanentFailure,
+                TaskbarSpaceSnapshot.Invalid(),
+                stage,
+                exceptionDetail,
+                nativeTrayRect,
+                observedChevronRect,
+                effectiveTrayRect,
+                maxAppRight);
+        }
+    }
+
     public interface ITaskbarSpaceProvider : IDisposable
     {
         TaskbarSpaceSnapshot GetLatestSnapshot();
@@ -59,14 +154,49 @@ namespace WindicatorPlus
         private const int STATE_RUNNING = 1;
         private const int STATE_STOPPED = 2;
 
+        public const int MAX_PROBE_ATTEMPTS = 3;
+        public const int PROBE_RETRY_INTERVAL_MS = 40;
+        public const long TOTAL_PROBE_BUDGET_MS = 900;
+
+        public const int HRESULT_UIA_E_ELEMENTNOTAVAILABLE = unchecked((int)0x80040201);
+        public const int HRESULT_UIA_E_TIMEOUT = unchecked((int)0x80131505);
+        public const int HRESULT_RPC_E_TIMEOUT = unchecked((int)0x8001011F);
+
+        internal Func<TaskbarProbeResult> ProbeAttemptFunc { get; set; }
+        internal Func<int, bool> WaitFunc { get; set; }
+
         private int _state = STATE_INIT;
         private Thread _workerThread;
         private readonly ManualResetEvent _stopEvent = new ManualResetEvent(false);
         private TaskbarSpaceSnapshot _latestSnapshot = TaskbarSpaceSnapshot.Invalid();
         private readonly object _snapshotLock = new object();
         private readonly int _pollIntervalMs;
+        private Rectangle _lastObservedChevron = Rectangle.Empty;
+        private Rectangle _lastNativeTrayRect = Rectangle.Empty;
+        private Rectangle _lastEffectiveTrayRect = Rectangle.Empty;
+        private int _lastValidButtonsCount = 0;
+
+        private struct ProbeDiagnosticKey
+        {
+            public bool IsValid;
+            public Rectangle TaskbarRect;
+            public Rectangle NativeTrayRect;
+            public Rectangle ObservedChevronRect;
+            public Rectangle EffectiveTrayRect;
+            public int MaxAppRight;
+            public int ValidButtonsCount;
+        }
+        private ProbeDiagnosticKey _lastProbeDiagKey;
+        private bool _hasProbeDiagKey = false;
 
         public event Action<TaskbarSpaceSnapshot> SpaceChanged;
+
+        private readonly TaskbarChevronResolver _chevronResolver = new TaskbarChevronResolver();
+
+        internal TaskbarChevronResolver ChevronResolver
+        {
+            get { return _chevronResolver; }
+        }
 
         public TaskbarSpaceMonitor(int pollIntervalMs = 500)
         {
@@ -140,14 +270,24 @@ namespace WindicatorPlus
 
         private void WorkerLoop()
         {
+            NativeTaskbarAutomation nativeAutomation = null;
             try
             {
+                try
+                {
+                    nativeAutomation = new NativeTaskbarAutomation();
+                }
+                catch (Exception ex)
+                {
+                    RuntimeTrace.LogProbeFailure("NativeAutomationInit", RuntimeTrace.FormatProbeException(ex), Rectangle.Empty, Rectangle.Empty, Rectangle.Empty, 0);
+                }
+
                 while (Volatile.Read(ref _state) == STATE_RUNNING)
                 {
                     TaskbarSpaceSnapshot snap;
                     try
                     {
-                        snap = ProbeTaskbarSpaceCore();
+                        snap = ProbeTaskbarSpaceCore(nativeAutomation);
                     }
                     catch
                     {
@@ -186,6 +326,16 @@ namespace WindicatorPlus
             }
             finally
             {
+                if (nativeAutomation != null)
+                {
+                    try
+                    {
+                        nativeAutomation.Dispose();
+                    }
+                    catch { }
+                    nativeAutomation = null;
+                }
+
                 // 契约：用线程 finally 持有 signal 释放
                 try
                 {
@@ -197,7 +347,15 @@ namespace WindicatorPlus
 
         public TaskbarSpaceSnapshot ProbeOnce()
         {
-            return ProbeTaskbarSpaceCore();
+            if (ProbeAttemptFunc != null)
+            {
+                return ProbeTaskbarSpaceCore(null);
+            }
+
+            using (NativeTaskbarAutomation nativeAutomation = new NativeTaskbarAutomation())
+            {
+                return ProbeTaskbarSpaceCore(nativeAutomation);
+            }
         }
 
         private void ProcessNewSnapshot(TaskbarSpaceSnapshot snap)
@@ -231,6 +389,35 @@ namespace WindicatorPlus
                 }
             }
 
+            if (changed)
+            {
+                Rectangle nativeTr = snap.IsValid ? _lastNativeTrayRect : Rectangle.Empty;
+                Rectangle chevron = snap.IsValid ? _lastObservedChevron : Rectangle.Empty;
+                Rectangle effectiveTr = snap.IsValid ? _lastEffectiveTrayRect : snap.TrayRect;
+                int btnCount = snap.IsValid ? _lastValidButtonsCount : 0;
+
+                RuntimeTrace.LogProbeChange(
+                    snap.IsValid,
+                    snap.TaskbarRect,
+                    nativeTr,
+                    chevron,
+                    effectiveTr,
+                    snap.MaxAppRight,
+                    btnCount);
+
+                _lastProbeDiagKey = new ProbeDiagnosticKey
+                {
+                    IsValid = snap.IsValid,
+                    TaskbarRect = snap.TaskbarRect,
+                    NativeTrayRect = nativeTr,
+                    ObservedChevronRect = chevron,
+                    EffectiveTrayRect = effectiveTr,
+                    MaxAppRight = snap.MaxAppRight,
+                    ValidButtonsCount = btnCount
+                };
+                _hasProbeDiagKey = true;
+            }
+
             if (changed && SpaceChanged != null && Volatile.Read(ref _state) == STATE_RUNNING)
             {
                 try
@@ -257,109 +444,353 @@ namespace WindicatorPlus
             return new TaskbarSpaceSnapshot(maxAppRight, trayLeft, tbRect, trRect, true);
         }
 
-        private TaskbarSpaceSnapshot ProbeTaskbarSpaceCore()
+        private TaskbarSpaceSnapshot ProbeTaskbarSpaceCore(NativeTaskbarAutomation nativeAutomation = null)
         {
+            return ProbeTaskbarSpaceWithRetry(nativeAutomation);
+        }
+
+        internal static bool IsTransientProbeException(Exception ex)
+        {
+            while (ex != null)
+            {
+                if (ex is ElementNotAvailableException)
+                {
+                    return true;
+                }
+
+                if (ex is TimeoutException)
+                {
+                    return true;
+                }
+
+                if (ex is System.Runtime.InteropServices.COMException)
+                {
+                    int hr = ((System.Runtime.InteropServices.COMException)ex).ErrorCode;
+                    if (hr == HRESULT_UIA_E_ELEMENTNOTAVAILABLE ||
+                        hr == HRESULT_UIA_E_TIMEOUT ||
+                        hr == HRESULT_RPC_E_TIMEOUT)
+                    {
+                        return true;
+                    }
+                    return false;
+                }
+
+                if (ex is InvalidOperationException &&
+                    string.Equals(ex.Message, "App button geometry unavailable", StringComparison.Ordinal))
+                {
+                    return true;
+                }
+
+                ex = ex.InnerException;
+            }
+
+            return false;
+        }
+
+        internal bool WaitForRetry(int delayMs)
+        {
+            if (WaitFunc != null)
+            {
+                return WaitFunc(delayMs);
+            }
+
+            if (Volatile.Read(ref _state) == STATE_RUNNING)
+            {
+                try
+                {
+                    return _stopEvent.WaitOne(delayMs);
+                }
+                catch (ObjectDisposedException)
+                {
+                    return true;
+                }
+            }
+            else
+            {
+                try
+                {
+                    if (_stopEvent != null)
+                    {
+                        return _stopEvent.WaitOne(delayMs);
+                    }
+                }
+                catch (ObjectDisposedException)
+                {
+                    return true;
+                }
+
+                Thread.Sleep(delayMs);
+                return false;
+            }
+        }
+
+        internal TaskbarSpaceSnapshot ProbeTaskbarSpaceWithRetry(NativeTaskbarAutomation nativeAutomation = null)
+        {
+            Stopwatch overallSw = Stopwatch.StartNew();
+            TaskbarProbeResult lastResult = null;
+
+            for (int attempt = 1; attempt <= MAX_PROBE_ATTEMPTS; attempt++)
+            {
+                if (Volatile.Read(ref _state) == STATE_STOPPED)
+                {
+                    return TaskbarSpaceSnapshot.Invalid();
+                }
+
+                if (overallSw.ElapsedMilliseconds > TOTAL_PROBE_BUDGET_MS)
+                {
+                    RuntimeTrace.LogProbeFailure("OverallBudgetExceeded",
+                        string.Format("Total probe budget exceeded: {0}ms", overallSw.ElapsedMilliseconds),
+                        Rectangle.Empty, Rectangle.Empty, Rectangle.Empty, 0);
+                    return TaskbarSpaceSnapshot.Invalid();
+                }
+
+                TaskbarProbeResult result;
+                try
+                {
+                    result = ProbeAttemptFunc != null ? ProbeAttemptFunc() : ProbeTaskbarSpaceAttempt(nativeAutomation, overallSw);
+                }
+                catch (Exception ex)
+                {
+                    string exDetail = RuntimeTrace.FormatProbeException(ex);
+                    if (IsTransientProbeException(ex))
+                    {
+                        result = TaskbarProbeResult.Transient("ProbeExecution", exDetail, Rectangle.Empty, Rectangle.Empty, Rectangle.Empty, 0);
+                    }
+                    else
+                    {
+                        RuntimeTrace.LogProbeFailure("ProbeExecution", exDetail, Rectangle.Empty, Rectangle.Empty, Rectangle.Empty, 0);
+                        result = TaskbarProbeResult.Permanent("ProbeExecution", exDetail, Rectangle.Empty, Rectangle.Empty, Rectangle.Empty, 0);
+                    }
+                }
+
+                TaskbarProbeResult previousResult = lastResult;
+                lastResult = result;
+
+                if (result.Status == TaskbarProbeStatus.Success)
+                {
+                    if (attempt > 1)
+                    {
+                        string recoveredStage = !string.IsNullOrEmpty(result.Stage) ? result.Stage : (previousResult != null ? previousResult.Stage : "");
+                        RuntimeTrace.LogProbeRetryResult(true, attempt, MAX_PROBE_ATTEMPTS, recoveredStage);
+                    }
+                    return result.Snapshot;
+                }
+
+                if (result.Status == TaskbarProbeStatus.PermanentFailure)
+                {
+                    if (attempt > 1)
+                    {
+                        RuntimeTrace.LogProbeRetryResult(false, attempt, MAX_PROBE_ATTEMPTS, result.Stage);
+                    }
+                    RuntimeTrace.LogProbeFailure(
+                        result.Stage,
+                        result.ExceptionDetail,
+                        result.NativeTrayRect,
+                        result.ObservedChevronRect,
+                        result.EffectiveTrayRect,
+                        result.MaxAppRight);
+                    return TaskbarSpaceSnapshot.Invalid();
+                }
+
+                // Transient failure
+                RuntimeTrace.LogProbeRetryAttempt(attempt, MAX_PROBE_ATTEMPTS, result.Stage, result.ExceptionDetail, PROBE_RETRY_INTERVAL_MS);
+
+                if (attempt < MAX_PROBE_ATTEMPTS)
+                {
+                    long remaining = TOTAL_PROBE_BUDGET_MS - overallSw.ElapsedMilliseconds;
+                    if (remaining <= PROBE_RETRY_INTERVAL_MS)
+                    {
+                        return TaskbarSpaceSnapshot.Invalid();
+                    }
+
+                    bool aborted = WaitForRetry(PROBE_RETRY_INTERVAL_MS);
+                    if (aborted || Volatile.Read(ref _state) == STATE_STOPPED)
+                    {
+                        return TaskbarSpaceSnapshot.Invalid();
+                    }
+                }
+            }
+
+            if (lastResult != null)
+            {
+                RuntimeTrace.LogProbeRetryResult(false, MAX_PROBE_ATTEMPTS, MAX_PROBE_ATTEMPTS, lastResult.Stage);
+                RuntimeTrace.LogProbeFailure(
+                    lastResult.Stage,
+                    lastResult.ExceptionDetail,
+                    lastResult.NativeTrayRect,
+                    lastResult.ObservedChevronRect,
+                    lastResult.EffectiveTrayRect,
+                    lastResult.MaxAppRight);
+            }
+
+            return TaskbarSpaceSnapshot.Invalid();
+        }
+
+        internal TaskbarProbeResult ProbeTaskbarSpaceAttempt()
+        {
+            return ProbeTaskbarSpaceAttempt(null, null);
+        }
+
+        internal TaskbarProbeResult ProbeTaskbarSpaceAttempt(NativeTaskbarAutomation nativeAutomation, Stopwatch overallSw = null)
+        {
+            Rectangle nativeTrRect = Rectangle.Empty;
+            Rectangle observedChevronRect = Rectangle.Empty;
+            Rectangle effectiveTrRect = Rectangle.Empty;
+            int maxAppRight = 0;
+            int validButtonsCount = 0;
+
             IntPtr hTaskbar = NativeMethods.FindWindow("Shell_TrayWnd", null);
             if (hTaskbar == IntPtr.Zero)
             {
-                return TaskbarSpaceSnapshot.Invalid();
+                ChevronResolver.Reset();
+                _lastObservedChevron = Rectangle.Empty;
+                return TaskbarProbeResult.Permanent("FindShell", null, nativeTrRect, observedChevronRect, effectiveTrRect, maxAppRight);
             }
 
             NativeMethods.RECT rcTaskbar;
             if (!NativeMethods.GetWindowRect(hTaskbar, out rcTaskbar))
             {
-                return TaskbarSpaceSnapshot.Invalid();
+                ChevronResolver.Reset();
+                _lastObservedChevron = Rectangle.Empty;
+                return TaskbarProbeResult.Permanent("GetShellRect", null, nativeTrRect, observedChevronRect, effectiveTrRect, maxAppRight);
             }
 
             Rectangle tbRect = Rectangle.FromLTRB(rcTaskbar.Left, rcTaskbar.Top, rcTaskbar.Right, rcTaskbar.Bottom);
             if (tbRect.Width <= 0 || tbRect.Height <= 0)
             {
-                return TaskbarSpaceSnapshot.Invalid();
+                ChevronResolver.Reset();
+                _lastObservedChevron = Rectangle.Empty;
+                return TaskbarProbeResult.Permanent("InvalidShellRect", null, nativeTrRect, observedChevronRect, effectiveTrRect, maxAppRight);
             }
 
             // 契约：缺tray均Invalid
             IntPtr hTray = NativeMethods.FindWindowEx(hTaskbar, IntPtr.Zero, "TrayNotifyWnd", null);
             if (hTray == IntPtr.Zero)
             {
-                return TaskbarSpaceSnapshot.Invalid();
+                ChevronResolver.Reset();
+                _lastObservedChevron = Rectangle.Empty;
+                return TaskbarProbeResult.Permanent("FindTray", null, nativeTrRect, observedChevronRect, effectiveTrRect, maxAppRight);
             }
 
             NativeMethods.RECT rcTray;
             if (!NativeMethods.GetWindowRect(hTray, out rcTray))
             {
-                return TaskbarSpaceSnapshot.Invalid();
+                ChevronResolver.Reset();
+                _lastObservedChevron = Rectangle.Empty;
+                return TaskbarProbeResult.Permanent("GetTrayRect", null, nativeTrRect, observedChevronRect, effectiveTrRect, maxAppRight);
             }
 
             Rectangle trRect = Rectangle.FromLTRB(rcTray.Left, rcTray.Top, rcTray.Right, rcTray.Bottom);
+            nativeTrRect = trRect;
+            effectiveTrRect = trRect;
+
             if (trRect.Width <= 0 || trRect.Height <= 0)
             {
-                return TaskbarSpaceSnapshot.Invalid();
+                ChevronResolver.Reset();
+                _lastObservedChevron = Rectangle.Empty;
+                return TaskbarProbeResult.Permanent("InvalidTrayRect", null, nativeTrRect, observedChevronRect, effectiveTrRect, maxAppRight);
             }
 
             int trayLeft = trRect.Left;
             if (trayLeft <= tbRect.Left || trayLeft > tbRect.Right)
             {
-                return TaskbarSpaceSnapshot.Invalid();
+                ChevronResolver.Reset();
+                _lastObservedChevron = Rectangle.Empty;
+                return TaskbarProbeResult.Permanent("TrayBoundsOutsideTaskbar", null, nativeTrRect, observedChevronRect, effectiveTrRect, maxAppRight);
             }
 
-            int maxAppRight = 0;
-            int validButtonsCount = 0;
-
+            string currentStage = "FindChevron";
+            NativeTaskbarAutomation automationToUse = nativeAutomation;
+            bool ownsAutomation = false;
             try
             {
-                AutomationElement taskbarElem = AutomationElement.FromHandle(hTaskbar);
-                if (taskbarElem == null)
+                if (automationToUse == null)
                 {
-                    return TaskbarSpaceSnapshot.Invalid();
+                    automationToUse = new NativeTaskbarAutomation();
+                    ownsAutomation = true;
                 }
 
-                // 在 Windows 11 下，折叠小箭头往往位于 TrayNotifyWnd 左侧 30~50px
-                // 自动探测折叠箭头精确坐标，将托盘真实左起始边界向左拓展到折叠小箭头左侧
-                // 契约：限制 200 节点深 4~6，明确 Chevron/语言名匹配，不吞异常冒充有效，保留真实 trRect 基线
-                AutomationElement chevronElem = FindChevronButton(taskbarElem, maxDepth: 6, maxNodes: 200);
-                if (chevronElem != null)
-                {
-                    System.Windows.Rect cRect = chevronElem.Current.BoundingRectangle;
-                    if (!cRect.IsEmpty && cRect.Left > tbRect.Left && cRect.Left < trayLeft)
-                    {
-                        trayLeft = (int)Math.Floor(cRect.Left);
-                        trRect = new Rectangle(trayLeft, trRect.Top, trRect.Right - trayLeft, trRect.Height);
-                    }
-                }
+                Stopwatch probeSw = overallSw ?? Stopwatch.StartNew();
+                NativeProbeRawResult rawResult = automationToUse.ProbeTaskbarElements(
+                    hTaskbar,
+                    hTray,
+                    trayLeft,
+                    probeSw,
+                    out currentStage);
 
-                // 契约：bounded tree遍历，找AutomationId=TaskbarFrameRepeater(Group)优先，最多7层/合理节点上限
-                AutomationElement repeaterElem = FindTaskbarFrameRepeater(taskbarElem, maxDepth: 4);
-                if (repeaterElem != null)
-                {
-                    Condition btnCond = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button);
-                    AutomationElementCollection children = repeaterElem.FindAll(TreeScope.Children, btnCond);
-                    if (children != null && children.Count > 0)
-                    {
-                        foreach (AutomationElement btn in children)
-                        {
-                            if (ProcessAppButton(btn, trayLeft, ref maxAppRight))
-                            {
-                                validButtonsCount++;
-                            }
-                        }
-                    }
-                }
+                observedChevronRect = rawResult.ObservedChevronRect;
+                validButtonsCount = rawResult.ValidButtonsCount;
+                maxAppRight = rawResult.MaxAppRight;
 
-                // Unknown shell structure is not evidence of free space. Fail closed instead
-                // of accepting a partial traversal that could miss the rightmost app.
+                _lastObservedChevron = observedChevronRect;
+                trRect = ChevronResolver.ResolveTrayRect(hTaskbar, tbRect, trRect, observedChevronRect);
+                effectiveTrRect = trRect;
+                trayLeft = trRect.Left;
 
                 // 契约：0个有效button / 无有效buttons 均 Invalid，绝不允许 MaxAppRight=0 return valid=true 把整个taskbar当空白
                 if (validButtonsCount == 0 || maxAppRight <= 0)
                 {
-                    return TaskbarSpaceSnapshot.Invalid();
+                    return TaskbarProbeResult.Permanent("NoValidAppButtons", null, nativeTrRect, observedChevronRect, effectiveTrRect, maxAppRight);
                 }
 
-                return EvaluateTaskbarSnapshot(tbRect, trRect, validButtonsCount, maxAppRight);
+                _lastNativeTrayRect = nativeTrRect;
+                _lastEffectiveTrayRect = effectiveTrRect;
+                _lastValidButtonsCount = validButtonsCount;
+
+                // 原生/chevron变化但effective没变也记录（在probe末用独立diagnostic last-key比较，不影响SpaceChanged）
+                if (_hasProbeDiagKey && _lastProbeDiagKey.IsValid)
+                {
+                    bool nativeOrChevronChanged = (nativeTrRect != _lastProbeDiagKey.NativeTrayRect ||
+                                                   observedChevronRect != _lastProbeDiagKey.ObservedChevronRect);
+                    bool effectiveUnchanged = (effectiveTrRect == _lastProbeDiagKey.EffectiveTrayRect &&
+                                               tbRect == _lastProbeDiagKey.TaskbarRect &&
+                                               maxAppRight == _lastProbeDiagKey.MaxAppRight);
+
+                    if (nativeOrChevronChanged && effectiveUnchanged)
+                    {
+                        RuntimeTrace.LogProbeChange(
+                            true,
+                            tbRect,
+                            nativeTrRect,
+                            observedChevronRect,
+                            effectiveTrRect,
+                            maxAppRight,
+                            validButtonsCount);
+
+                        _lastProbeDiagKey.NativeTrayRect = nativeTrRect;
+                        _lastProbeDiagKey.ObservedChevronRect = observedChevronRect;
+                    }
+                }
+
+                TaskbarSpaceSnapshot snapshot = EvaluateTaskbarSnapshot(tbRect, trRect, validButtonsCount, maxAppRight);
+                if (!snapshot.IsValid)
+                {
+                    return TaskbarProbeResult.Permanent("EvaluateSnapshotFailed", null, nativeTrRect, observedChevronRect, effectiveTrRect, maxAppRight);
+                }
+
+                return TaskbarProbeResult.Success(snapshot, nativeTrRect, observedChevronRect, effectiveTrRect, maxAppRight);
             }
-            catch
+            catch (Exception ex)
             {
                 // 契约：读取任一app失败/任何UIA异常均Invalid，不吞错冒充通过
-                return TaskbarSpaceSnapshot.Invalid();
+                string exDetail = RuntimeTrace.FormatProbeException(ex);
+                if (IsTransientProbeException(ex))
+                {
+                    return TaskbarProbeResult.Transient(currentStage, exDetail, nativeTrRect, observedChevronRect, effectiveTrRect, maxAppRight);
+                }
+
+                return TaskbarProbeResult.Permanent(currentStage, exDetail, nativeTrRect, observedChevronRect, effectiveTrRect, maxAppRight);
+            }
+            finally
+            {
+                if (ownsAutomation && automationToUse != null)
+                {
+                    try
+                    {
+                        automationToUse.Dispose();
+                    }
+                    catch { }
+                }
             }
         }
 
@@ -558,6 +989,119 @@ namespace WindicatorPlus
             }
 
             return null;
+        }
+    }
+
+    internal class TaskbarChevronResolver
+    {
+        private IntPtr _cachedShellHwnd = IntPtr.Zero;
+        private Rectangle _cachedTaskbarRect = Rectangle.Empty;
+        private Rectangle _cachedTrayRect = Rectangle.Empty;
+        private int? _cachedChevronLeft = null;
+
+        internal IntPtr CachedShellHwnd
+        {
+            get { return _cachedShellHwnd; }
+        }
+
+        internal Rectangle CachedTaskbarRect
+        {
+            get { return _cachedTaskbarRect; }
+        }
+
+        internal Rectangle CachedTrayRect
+        {
+            get { return _cachedTrayRect; }
+        }
+
+        internal int? CachedChevronLeft
+        {
+            get { return _cachedChevronLeft; }
+        }
+
+        public void Reset()
+        {
+            _cachedShellHwnd = IntPtr.Zero;
+            _cachedTaskbarRect = Rectangle.Empty;
+            _cachedTrayRect = Rectangle.Empty;
+            _cachedChevronLeft = null;
+        }
+
+        public Rectangle ResolveTrayRect(IntPtr shellHwnd, Rectangle nativeTaskbarRect, Rectangle nativeTrayRect, Rectangle observedChevronRect)
+        {
+            if (shellHwnd == IntPtr.Zero ||
+                nativeTaskbarRect.IsEmpty || nativeTaskbarRect.Width <= 0 || nativeTaskbarRect.Height <= 0 ||
+                nativeTrayRect.IsEmpty || nativeTrayRect.Width <= 0 || nativeTrayRect.Height <= 0)
+            {
+                Reset();
+                return nativeTrayRect;
+            }
+
+            if (_cachedShellHwnd != shellHwnd ||
+                _cachedTaskbarRect != nativeTaskbarRect ||
+                _cachedTrayRect != nativeTrayRect)
+            {
+                _cachedShellHwnd = shellHwnd;
+                _cachedTaskbarRect = nativeTaskbarRect;
+                _cachedTrayRect = nativeTrayRect;
+                _cachedChevronLeft = null;
+            }
+
+            if (IsChevronRectValid(observedChevronRect, nativeTaskbarRect, nativeTrayRect))
+            {
+                if (_cachedChevronLeft.HasValue)
+                {
+                    _cachedChevronLeft = Math.Min(_cachedChevronLeft.Value, observedChevronRect.Left);
+                }
+                else
+                {
+                    _cachedChevronLeft = observedChevronRect.Left;
+                }
+            }
+
+            if (_cachedChevronLeft.HasValue &&
+                _cachedChevronLeft.Value < nativeTrayRect.Left &&
+                _cachedChevronLeft.Value > nativeTaskbarRect.Left)
+            {
+                int effectiveLeft = _cachedChevronLeft.Value;
+                return new Rectangle(effectiveLeft, nativeTrayRect.Top, nativeTrayRect.Right - effectiveLeft, nativeTrayRect.Height);
+            }
+
+            return nativeTrayRect;
+        }
+
+        public static bool IsChevronRectValid(Rectangle chevronRect, Rectangle tbRect, Rectangle trRect)
+        {
+            if (chevronRect.IsEmpty || chevronRect.Width <= 0 || chevronRect.Height <= 0)
+            {
+                return false;
+            }
+
+            // 水平必须位于 taskbar 边界内
+            if (chevronRect.Left < tbRect.Left || chevronRect.Right > tbRect.Right)
+            {
+                return false;
+            }
+
+            // 垂直必须位于 taskbar 边界内 (弹出面板 flyout top/bottom 越界在此被拒绝)
+            if (chevronRect.Top < tbRect.Top || chevronRect.Bottom > tbRect.Bottom)
+            {
+                return false;
+            }
+
+            // 垂直相交校验
+            if (chevronRect.Top >= tbRect.Bottom || chevronRect.Bottom <= tbRect.Top)
+            {
+                return false;
+            }
+
+            // 必须位于原生托盘左侧
+            if (chevronRect.Left >= trRect.Left)
+            {
+                return false;
+            }
+
+            return true;
         }
     }
 }

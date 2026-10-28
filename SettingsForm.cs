@@ -10,14 +10,13 @@ namespace WindicatorPlus
 {
     public class SettingsForm : Form
     {
-        public const string CURRENT_VERSION = "v1.3.0";
+        public const string CURRENT_VERSION = "v1.3.12";
 
 
         private AppConfig _config;
         private WatermarkWindow _watermark;
         private TrayIconManager _trayManager;
         private DesktopWatcher _watcher;
-        private TaskbarTintOverlay _tintOverlay;
 
         public bool SuppressPersistenceForTesting { get; set; }
 
@@ -52,6 +51,9 @@ namespace WindicatorPlus
         private TrackBar _tbOpacity;
         private Label _lblOpacityVal;
         private TextBox _txtTitleTpl;
+        private TrackBar _tbTitleFontSize;
+        private Label _lblTitleFontSizeVal;
+        private CheckBox _chkShowSubtitle;
         private TextBox _txtSubtitleTpl;
         private DarkToggleSwitch _swShowBigNum;
         private DarkToggleSwitch _swShowCard;
@@ -59,8 +61,6 @@ namespace WindicatorPlus
 
         // Taskbar Tint Overlay Controls
         private DarkToggleSwitch _swTaskbarTint;
-        private TrackBar _tbTintOpacity;
-        private Label _lblTintOpacityVal;
 
         // Position & System Controls
         private ComboBox _cbPosition;
@@ -80,13 +80,12 @@ namespace WindicatorPlus
             }
         }
 
-        public SettingsForm(AppConfig config, WatermarkWindow watermark, TrayIconManager trayManager, DesktopWatcher watcher, TaskbarTintOverlay tintOverlay = null)
+        public SettingsForm(AppConfig config, WatermarkWindow watermark, TrayIconManager trayManager, DesktopWatcher watcher)
         {
             _config = config ?? new AppConfig();
             _watermark = watermark;
             _trayManager = trayManager;
             _watcher = watcher;
-            _tintOverlay = tintOverlay;
             SuppressPersistenceForTesting = false;
 
             InitializeAitiyUI();
@@ -1033,7 +1032,49 @@ namespace WindicatorPlus
                 ApplyDesignerChanges();
             };
 
+            _tbTitleFontSize = AddSliderRow(
+                cardTemplate,
+                "主标题字号",
+                "仅桌面水印生效；任务栏按栏高自动计算最佳字号",
+                10,
+                48,
+                _config.TitleFontSize > 0 ? _config.TitleFontSize : 14,
+                "px",
+                out _lblTitleFontSizeVal);
+
+            _tbTitleFontSize.Scroll += (s, e) =>
+            {
+                if (_isBindingUI) return;
+                int val = _tbTitleFontSize.Value;
+                _lblTitleFontSizeVal.Text = val + "px";
+                _config.TitleFontSize = val;
+                ApplyDesignerChanges();
+            };
+
+            _chkShowSubtitle = new CheckBox
+            {
+                Text = "显示副标题模板 (未勾选时仅显示主标题并水平垂直双向居中)",
+                ForeColor = Color.FromArgb(220, 225, 235),
+                Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Regular),
+                AutoSize = true,
+                Checked = _config.ShowSubtitle,
+                Cursor = Cursors.Hand,
+                Margin = new Padding(0, 10, 0, 6)
+            };
+            _chkShowSubtitle.CheckedChanged += (s, e) =>
+            {
+                if (_isBindingUI) return;
+                _config.ShowSubtitle = _chkShowSubtitle.Checked;
+                if (_txtSubtitleTpl != null)
+                {
+                    _txtSubtitleTpl.Enabled = _chkShowSubtitle.Checked;
+                }
+                ApplyDesignerChanges();
+            };
+            AddToCard(cardTemplate, _chkShowSubtitle);
+
             _txtSubtitleTpl = AddInputRow(cardTemplate, "副标题模板：", _config.SubtitleTemplate ?? "虚拟桌面 {n} (共 {total} 个)");
+            _txtSubtitleTpl.Enabled = _config.ShowSubtitle;
             _txtSubtitleTpl.TextChanged += (s, e) =>
             {
                 if (_isBindingUI) return;
@@ -1150,7 +1191,9 @@ namespace WindicatorPlus
                     _config.SubtitleTemplate,
                     _config.ShowBigNumber,
                     _config.ShowBackgroundCard,
-                    _config.WatermarkColorTheme);
+                    _config.WatermarkColorTheme,
+                    _config.ShowSubtitle,
+                    _config.TitleFontSize);
             }
             SafeSaveConfig();
         }
@@ -1242,46 +1285,21 @@ namespace WindicatorPlus
 
             root.Controls.Add(cardMod);
 
-            // 3. Taskbar Ambient Tint Card
-            DarkCardPanel cardTint = CreateCard("任务栏专属半透明微光氛围色 (随虚拟桌面变色)");
+            // 3. Desktop Exclusive Color Card
+            DarkCardPanel cardTint = CreateCard("水印桌面专属颜色 (随虚拟桌面变色)");
 
-            DarkToggleSwitch swTintDummy;
-            AddTwoColumnSwitches(
-                cardTint,
-                "任务栏专属氛围色",
-                "为当前桌面镀上专属半透明色彩，100% 鼠标完全击穿穿透",
-                out _swTaskbarTint,
-                "开机自动呈现",
-                "随桌面切换毫秒级平滑变色，透出 Windows 11 暗黑质感",
-                out swTintDummy);
-            swTintDummy.Visible = false;
+            AddToCard(cardTint, CreateSwitchCell(
+                "水印使用桌面专属色",
+                "在“桌面命名”中设置各桌面的水印颜色；关闭后恢复原有主题。",
+                out _swTaskbarTint));
 
             _swTaskbarTint.CheckedChanged += (s, e) =>
             {
                 if (_isBindingUI) return;
                 _config.TaskbarTintEnabled = _swTaskbarTint.Checked;
-                if (_tintOverlay != null)
+                if (_watermark != null)
                 {
-                    _tintOverlay.ApplyConfig(_config, _watcher != null ? _watcher.CurrentDesktop : 1);
-                }
-                SafeSaveConfig();
-            };
-
-            _tbTintOpacity = AddSliderRow(
-                cardTint,
-                "氛围色浓度 (微透饱和度)",
-                "推荐 12%~20%，透出底层图标与开始菜单，氛围高级且绝不刺眼遮挡",
-                5, 40, _config.TaskbarTintOpacity, "%",
-                out _lblTintOpacityVal);
-
-            _tbTintOpacity.Scroll += (s, e) =>
-            {
-                if (_isBindingUI) return;
-                _config.TaskbarTintOpacity = _tbTintOpacity.Value;
-                if (_lblTintOpacityVal != null) _lblTintOpacityVal.Text = _tbTintOpacity.Value + "%";
-                if (_tintOverlay != null)
-                {
-                    _tintOverlay.ApplyConfig(_config, _watcher != null ? _watcher.CurrentDesktop : 1);
+                    _watermark.ApplyConfig(_config);
                 }
                 SafeSaveConfig();
             };
@@ -1442,19 +1460,19 @@ namespace WindicatorPlus
                 };
                 txtWrapper.Controls.Add(txt);
 
-                string curColor = _config.GetTaskbarTintColor(dIdx);
-                Color clr = TaskbarTintOverlay.ParseHexColor(curColor, Color.FromArgb(124, 58, 237));
+                string curColor = _config.GetDesktopWatermarkColor(dIdx);
+                Color clr = AppConfig.ParseHexColor(curColor, Color.FromArgb(124, 58, 237));
                 string hexLabel = string.IsNullOrEmpty(curColor) ? "#7C3AED" : curColor.ToUpper();
 
                 Button btnColor = new Button
                 {
-                    Text = string.Format("● {0}", hexLabel),
+                    Text = string.Format("水印色 {0}", hexLabel),
                     Width = 160,
                     Height = 44,
                     BackColor = Color.FromArgb(40, clr.R, clr.G, clr.B),
                     ForeColor = Color.White,
                     FlatStyle = FlatStyle.Flat,
-                    Font = new Font("Segoe UI", 11F, FontStyle.Bold),
+                    Font = new Font("Segoe UI", 10.5F, FontStyle.Bold),
                     Cursor = Cursors.Hand,
                     Margin = new Padding(14, 6, 0, 8)
                 };
@@ -1468,8 +1486,8 @@ namespace WindicatorPlus
                     {
                         dlg.FullOpen = true; // 直接展开自定义调色盘
                         dlg.AnyColor = true;
-                        string oldHex = _config.GetTaskbarTintColor(capturedIdx);
-                        dlg.Color = TaskbarTintOverlay.ParseHexColor(oldHex, Color.FromArgb(124, 58, 237));
+                        string oldHex = _config.GetDesktopWatermarkColor(capturedIdx);
+                        dlg.Color = AppConfig.ParseHexColor(oldHex, Color.FromArgb(124, 58, 237));
 
                         if (dlg.ShowDialog(this) == DialogResult.OK)
                         {
@@ -1477,14 +1495,14 @@ namespace WindicatorPlus
                             string nextHex = string.Format("#{0:X2}{1:X2}{2:X2}", nextClr.R, nextClr.G, nextClr.B);
                             _config.SetTaskbarTintColor(capturedIdx, nextHex);
 
-                            btnColor.Text = string.Format("● {0}", nextHex);
+                            btnColor.Text = string.Format("水印色 {0}", nextHex);
                             btnColor.BackColor = Color.FromArgb(40, nextClr.R, nextClr.G, nextClr.B);
                             btnColor.FlatAppearance.BorderColor = nextClr;
 
                             SafeSaveConfig();
-                            if (_tintOverlay != null)
+                            if (_watermark != null)
                             {
-                                _tintOverlay.ApplyConfig(_config, _watcher != null ? _watcher.CurrentDesktop : 1);
+                                _watermark.ApplyConfig(_config);
                             }
                         }
                     }
@@ -1705,11 +1723,6 @@ namespace WindicatorPlus
 
                 // Taskbar Tint Controls
                 if (_swTaskbarTint != null) _swTaskbarTint.Checked = _config.TaskbarTintEnabled;
-                if (_tbTintOpacity != null)
-                {
-                    _tbTintOpacity.Value = Math.Max(5, Math.Min(40, _config.TaskbarTintOpacity));
-                    if (_lblTintOpacityVal != null) _lblTintOpacityVal.Text = _tbTintOpacity.Value + "%";
-                }
 
                 // Scale
                 if (_tbScale != null)
@@ -1727,7 +1740,21 @@ namespace WindicatorPlus
 
                 // Templates
                 if (_txtTitleTpl != null) _txtTitleTpl.Text = _config.TitleTemplate ?? "{name}";
-                if (_txtSubtitleTpl != null) _txtSubtitleTpl.Text = _config.SubtitleTemplate ?? "虚拟桌面 {n} (共 {total} 个)";
+                if (_tbTitleFontSize != null)
+                {
+                    int fs = _config.TitleFontSize > 0 ? Math.Max(10, Math.Min(48, _config.TitleFontSize)) : 14;
+                    _tbTitleFontSize.Value = fs;
+                    if (_lblTitleFontSizeVal != null) _lblTitleFontSizeVal.Text = fs + "px";
+                }
+                if (_chkShowSubtitle != null)
+                {
+                    _chkShowSubtitle.Checked = _config.ShowSubtitle;
+                }
+                if (_txtSubtitleTpl != null)
+                {
+                    _txtSubtitleTpl.Text = _config.SubtitleTemplate ?? "虚拟桌面 {n} (共 {total} 个)";
+                    _txtSubtitleTpl.Enabled = _config.ShowSubtitle;
+                }
                 if (_swShowBigNum != null) _swShowBigNum.Checked = _config.ShowBigNumber;
                 if (_swShowCard != null) _swShowCard.Checked = _config.ShowBackgroundCard;
 
@@ -1790,6 +1817,8 @@ namespace WindicatorPlus
                     _config.WatermarkOpacity = 40;
                     _config.TitleTemplate = "{name}";
                     _config.SubtitleTemplate = "虚拟桌面 {n} (共 {total} 个)";
+                    _config.ShowSubtitle = false;
+                    _config.TitleFontSize = 14;
                     _config.ShowBigNumber = true;
                     _config.ShowBackgroundCard = true;
                     _config.WatermarkColorTheme = "WhiteHighlight";
@@ -1797,7 +1826,13 @@ namespace WindicatorPlus
                     if (_tbScale != null) { _tbScale.Value = 100; _lblScaleVal.Text = "100%"; }
                     if (_tbOpacity != null) { _tbOpacity.Value = 40; _lblOpacityVal.Text = "40%"; }
                     if (_txtTitleTpl != null) _txtTitleTpl.Text = "{name}";
-                    if (_txtSubtitleTpl != null) _txtSubtitleTpl.Text = "虚拟桌面 {n} (共 {total} 个)";
+                    if (_tbTitleFontSize != null) { _tbTitleFontSize.Value = 14; _lblTitleFontSizeVal.Text = "14px"; }
+                    if (_chkShowSubtitle != null) _chkShowSubtitle.Checked = false;
+                    if (_txtSubtitleTpl != null)
+                    {
+                        _txtSubtitleTpl.Text = "虚拟桌面 {n} (共 {total} 个)";
+                        _txtSubtitleTpl.Enabled = false;
+                    }
                     if (_swShowBigNum != null) _swShowBigNum.Checked = true;
                     if (_swShowCard != null) _swShowCard.Checked = true;
                     if (_cbColorTheme != null) _cbColorTheme.SelectedIndex = 0;

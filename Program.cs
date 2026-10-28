@@ -3,6 +3,10 @@ using System.Diagnostics;
 using System.Threading;
 using System.Windows.Forms;
 
+[assembly: System.Reflection.AssemblyVersion("1.3.12.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.3.12.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.3.12")]
+
 namespace WindicatorPlus
 {
     static class Program
@@ -40,6 +44,8 @@ namespace WindicatorPlus
                 return;
             }
 
+            RuntimeTrace.LogAppStart(Process.GetCurrentProcess().Id, "1.3.12");
+
             Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
             Application.ThreadException += (s, e) => { };
             AppDomain.CurrentDomain.UnhandledException += (s, e) => { };
@@ -56,19 +62,12 @@ namespace WindicatorPlus
             // Desktop watcher
             DesktopWatcher watcher = new DesktopWatcher();
 
-            // Taskbar Tint Overlay (100% mouse-penetrating ambient color per desktop)
-            TaskbarTintOverlay tintOverlay = new TaskbarTintOverlay(config, 1);
-            if (config.TaskbarTintEnabled)
-            {
-                tintOverlay.Show();
-            }
-
             // Desktop loop switcher (wrap-around virtual desktop)
             DesktopLoopSwitcher loopSwitcher = new DesktopLoopSwitcher(watcher, config);
             loopSwitcher.Start();
 
             // Tray manager
-            TrayIconManager trayManager = new TrayIconManager(config, watermark, watcher, tintOverlay);
+            TrayIconManager trayManager = new TrayIconManager(config, watermark, watcher);
 
             // Wire desktop change event (dispatched to UI thread)
             watcher.DesktopChanged += (s, e) =>
@@ -80,10 +79,6 @@ namespace WindicatorPlus
                         watermark.BeginInvoke(new Action(() =>
                         {
                             trayManager.UpdateDesktop(e.CurrentDesktop, e.TotalDesktops);
-                            if (tintOverlay.IsHandleCreated && !tintOverlay.IsDisposed)
-                            {
-                                tintOverlay.UpdateDesktop(e.CurrentDesktop);
-                            }
                         }));
                     }
                     catch (Exception ex)
@@ -97,7 +92,6 @@ namespace WindicatorPlus
             int initCur, initTotal;
             watcher.QueryDesktops(out initCur, out initTotal);
             trayManager.UpdateDesktop(initCur, initTotal);
-            tintOverlay.UpdateDesktop(initCur);
 
             // Start background registry monitoring
             watcher.Start();
@@ -117,19 +111,22 @@ namespace WindicatorPlus
                         try { loopSwitcher.Dispose(); } catch { }
                         try { watcher.Stop(); } catch { }
                         try { watermark.Dispose(); } catch { }
-                        try { if (tintOverlay != null && !tintOverlay.IsDisposed) tintOverlay.Dispose(); } catch { }
                         try { trayManager.Dispose(); } catch { }
+                        RuntimeTrace.Shutdown("TrayExit");
                         Application.Exit();
                     }, null);
                 }
                 else
                 {
+                    RuntimeTrace.Shutdown("TrayExit");
                     Application.Exit();
                 }
             };
 
             // Run message loop
             Application.Run();
+
+            RuntimeTrace.Shutdown("AppRunExit");
 
             // Cleanup
             if (_appMutex != null)

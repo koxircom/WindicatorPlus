@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
 using System.IO;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -25,6 +26,8 @@ namespace WindicatorPlus
         public int WatermarkScale { get; set; } // 75 ~ 160 (Default 100%)
         public string TitleTemplate { get; set; } // e.g. "{name}" or "桌面 {n}"
         public string SubtitleTemplate { get; set; } // e.g. "虚拟桌面 {n} (共 {total} 个)"
+        public bool ShowSubtitle { get; set; } // Default false
+        public int TitleFontSize { get; set; } // 10 ~ 48 (Default 14)
         public bool ShowBigNumber { get; set; } // Default true
         public bool ShowBackgroundCard { get; set; } // Default true
         public string WatermarkColorTheme { get; set; } // "WhiteHighlight", "NeonPurple", "CyanGlow", "DarkSubtle"
@@ -36,7 +39,7 @@ namespace WindicatorPlus
 
         public Dictionary<int, string> DesktopNames { get; set; }
 
-        private static readonly string[] DefaultTintPalette = new string[]
+        public static readonly string[] DefaultTintPalette = new string[]
         {
             "#2563EB", // 1: Deep Blue (办公通讯)
             "#7C3AED", // 2: Cyber Violet (开发调试)
@@ -63,6 +66,8 @@ namespace WindicatorPlus
             WatermarkScale = 100;
             TitleTemplate = "{name}";
             SubtitleTemplate = "虚拟桌面 {n} (共 {total} 个)";
+            ShowSubtitle = false;
+            TitleFontSize = 14;
             ShowBigNumber = true;
             ShowBackgroundCard = true;
             WatermarkColorTheme = "WhiteHighlight"; // 默认超高显目纯白
@@ -94,6 +99,40 @@ namespace WindicatorPlus
             TaskbarTintColors[desktopIndex] = hexColor;
         }
 
+        public string GetDesktopWatermarkColor(int desktopIndex)
+        {
+            return GetTaskbarTintColor(desktopIndex);
+        }
+
+        public void SetDesktopWatermarkColor(int desktopIndex, string hexColor)
+        {
+            SetTaskbarTintColor(desktopIndex, hexColor);
+        }
+
+        public static Color ParseHexColor(string hex, Color fallback)
+        {
+            if (string.IsNullOrEmpty(hex)) return fallback;
+            string clean = hex.Trim().TrimStart('#');
+            if (clean.Length == 6)
+            {
+                try
+                {
+                    int r = Convert.ToInt32(clean.Substring(0, 2), 16);
+                    int g = Convert.ToInt32(clean.Substring(2, 2), 16);
+                    int b = Convert.ToInt32(clean.Substring(4, 2), 16);
+                    return Color.FromArgb(r, g, b);
+                }
+                catch { }
+            }
+            return fallback;
+        }
+
+        public Color GetDesktopWatermarkColorRgb(int desktopIndex)
+        {
+            string hex = GetDesktopWatermarkColor(desktopIndex);
+            return ParseHexColor(hex, Color.FromArgb(37, 99, 235));
+        }
+
         public string GetDesktopName(int desktopIndex)
         {
             if (DesktopNames != null && DesktopNames.ContainsKey(desktopIndex))
@@ -123,14 +162,48 @@ namespace WindicatorPlus
 
         public static AppConfig Load()
         {
+            return LoadFrom(ConfigFilePath);
+        }
+
+        public static AppConfig LoadFrom(string filePath)
+        {
+            try
+            {
+                if (File.Exists(filePath))
+                {
+                    string content = File.ReadAllText(filePath, System.Text.Encoding.UTF8);
+                    AppConfig cfg = LoadFromString(content);
+                    if (string.Equals(filePath, ConfigFilePath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        cfg.AutoStart = IsAutoStartEnabled();
+                    }
+                    return cfg;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("Error loading config from file: " + ex.Message);
+            }
+
+            AppConfig defaultConfig = new AppConfig();
+            if (string.Equals(filePath, ConfigFilePath, StringComparison.OrdinalIgnoreCase))
+            {
+                defaultConfig.AutoStart = IsAutoStartEnabled();
+            }
+            return defaultConfig;
+        }
+
+        public static AppConfig LoadFromString(string content)
+        {
             AppConfig config = new AppConfig();
+            if (string.IsNullOrEmpty(content)) return config;
 
             try
             {
-                if (File.Exists(ConfigFilePath))
+                using (StringReader sr = new StringReader(content))
                 {
-                    string[] lines = File.ReadAllLines(ConfigFilePath);
-                    foreach (string rawLine in lines)
+                    string rawLine;
+                    while ((rawLine = sr.ReadLine()) != null)
                     {
                         string line = rawLine.Trim();
                         if (string.IsNullOrEmpty(line) || line.StartsWith("#") || line.StartsWith(";"))
@@ -210,6 +283,16 @@ namespace WindicatorPlus
                             {
                                 config.SubtitleTemplate = val;
                             }
+                            else if (key.Equals("ShowSubtitle", StringComparison.OrdinalIgnoreCase))
+                            {
+                                bool b;
+                                if (bool.TryParse(val, out b)) config.ShowSubtitle = b;
+                            }
+                            else if (key.Equals("TitleFontSize", StringComparison.OrdinalIgnoreCase))
+                            {
+                                int fs;
+                                if (int.TryParse(val, out fs)) config.TitleFontSize = Math.Max(10, Math.Min(48, fs));
+                            }
                             else if (key.Equals("ShowBigNumber", StringComparison.OrdinalIgnoreCase))
                             {
                                 bool b;
@@ -258,24 +341,28 @@ namespace WindicatorPlus
             }
             catch (Exception ex)
             {
-                Debug.WriteLine("Error loading config: " + ex.Message);
+                Debug.WriteLine("Error parsing config: " + ex.Message);
             }
-
-            config.AutoStart = IsAutoStartEnabled();
 
             return config;
         }
 
         public static void Save(AppConfig config)
         {
+            SaveTo(config, ConfigFilePath);
+        }
+
+        public static void SaveTo(AppConfig config, string filePath)
+        {
             try
             {
-                if (!Directory.Exists(ConfigDir))
+                string dir = Path.GetDirectoryName(filePath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                 {
-                    Directory.CreateDirectory(ConfigDir);
+                    Directory.CreateDirectory(dir);
                 }
 
-                using (StreamWriter sw = new StreamWriter(ConfigFilePath, false, System.Text.Encoding.UTF8))
+                using (StreamWriter sw = new StreamWriter(filePath, false, System.Text.Encoding.UTF8))
                 {
                     sw.WriteLine("# Windicator+ Configuration");
                     sw.WriteLine(string.Format("WatermarkEnabled={0}", config.WatermarkEnabled));
@@ -292,6 +379,8 @@ namespace WindicatorPlus
                     sw.WriteLine(string.Format("WatermarkScale={0}", config.WatermarkScale));
                     sw.WriteLine(string.Format("TitleTemplate={0}", config.TitleTemplate));
                     sw.WriteLine(string.Format("SubtitleTemplate={0}", config.SubtitleTemplate));
+                    sw.WriteLine(string.Format("ShowSubtitle={0}", config.ShowSubtitle));
+                    sw.WriteLine(string.Format("TitleFontSize={0}", config.TitleFontSize));
                     sw.WriteLine(string.Format("ShowBigNumber={0}", config.ShowBigNumber));
                     sw.WriteLine(string.Format("ShowBackgroundCard={0}", config.ShowBackgroundCard));
                     sw.WriteLine(string.Format("WatermarkColorTheme={0}", config.WatermarkColorTheme));

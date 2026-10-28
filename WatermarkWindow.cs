@@ -19,6 +19,33 @@ namespace WindicatorPlus
         private int _currentDesktop = 1;
         private int _totalDesktops = 1;
         private string _desktopName = null;
+        private Dictionary<int, string> _desktopNames = new Dictionary<int, string>();
+        private int _desktopNamesRevision = 0;
+
+        private int _cachedSlotWidth = 0;
+        private int _cachedSlotTbHeight = 0;
+        private int _cachedSlotScale = 0;
+        private bool _cachedSlotShowBigNumber = false;
+        private int _cachedSlotTotal = 0;
+        private string _cachedSlotTemplate = null;
+        private int _cachedSlotNamesRevision = -1;
+        private bool _isSlotCacheValid = false;
+
+        internal void InvalidateTaskbarSlotCache()
+        {
+            _isSlotCacheValid = false;
+        }
+
+        internal bool IsTaskbarSlotCacheValid
+        {
+            get { return _isSlotCacheValid; }
+        }
+
+        internal int TaskbarSlotWidthCache
+        {
+            get { return _cachedSlotWidth; }
+        }
+
         private int _opacityPercent = 40;
         private string _style = "Card";
         private string _position = "BottomRight";
@@ -31,15 +58,253 @@ namespace WindicatorPlus
         private int _watermarkScale = 100;
         private string _titleTemplate = "{name}";
         private string _subtitleTemplate = "虚拟桌面 {n} (共 {total} 个)";
+        private bool _showSubtitle = false;
+        private int _titleFontSize = 14;
         private bool _showBigNumber = true;
         private bool _showBackgroundCard = true;
         private string _colorTheme = "WhiteHighlight";
+
+        private bool _useDesktopColor = true;
+        private Dictionary<int, string> _desktopColors = new Dictionary<int, string>();
 
         private int _windowWidth = 240;
         private int _windowHeight = 88;
         private bool _isTaskbarDocked = false; // True when positioned as an overlay over the Windows taskbar
         private bool _isTaskbarOverflowFloating = false; // True when taskbar has no horizontal space and watermark floats right above taskbar
         private Rectangle _actualScreenRect = Rectangle.Empty;
+
+        private Rectangle _lastTaskbarRect = Rectangle.Empty;
+        private Rectangle _lastTrayRect = Rectangle.Empty;
+        private bool _wasLastOverflowFloating = false;
+
+        // 最近成功停靠锚点（独立于 _actualScreenRect，专用于任务栏停靠在经历临时 Invalid/清空恢复时保持稳定锚点）
+        private Rectangle _lastSuccessfulDockedAnchor = Rectangle.Empty;
+        private Rectangle _lastSuccessfulDockedTaskbarRect = Rectangle.Empty;
+
+        // 单调时钟委托（默认使用 Stopwatch.GetTimestamp()，单元测试可注入以精确控制时间步进，禁止真实桌面 sleep）
+        internal static Func<long> MonotonicTicksProvider = () => Stopwatch.GetTimestamp();
+
+        internal static long GetCurrentMonotonicTicks()
+        {
+            var provider = MonotonicTicksProvider;
+            return provider != null ? provider() : Stopwatch.GetTimestamp();
+        }
+
+        private sealed class TaskbarAnchorSettleCandidate
+        {
+            public readonly Rectangle TaskbarRect;
+            public readonly Rectangle TrayRect;
+            public readonly int WindowWidth;
+            public readonly int WindowHeight;
+            public readonly int DesiredX;
+            public readonly long FirstSeenTicks;
+            public long LastSeenTicks;
+            public long LastSnapshotTimestamp;
+            public int SnapshotCount;
+
+            public TaskbarAnchorSettleCandidate(Rectangle tbRect, Rectangle trRect, int w, int h, int desiredX, long nowTicks, long initialSnapshotTimestamp)
+            {
+                TaskbarRect = tbRect;
+                TrayRect = trRect;
+                WindowWidth = w;
+                WindowHeight = h;
+                DesiredX = desiredX;
+                FirstSeenTicks = nowTicks;
+                LastSeenTicks = nowTicks;
+                LastSnapshotTimestamp = initialSnapshotTimestamp;
+                SnapshotCount = (initialSnapshotTimestamp != 0) ? 1 : 0;
+            }
+
+            public bool Matches(Rectangle tbRect, Rectangle trRect, int w, int h, int desiredX)
+            {
+                return TaskbarRect == tbRect &&
+                       TrayRect == trRect &&
+                       WindowWidth == w &&
+                       WindowHeight == h &&
+                       DesiredX == desiredX;
+            }
+
+            public void RecordSnapshot(long nowTicks, long snapshotTimestamp)
+            {
+                if (snapshotTimestamp != 0 && snapshotTimestamp > LastSnapshotTimestamp)
+                {
+                    LastSnapshotTimestamp = snapshotTimestamp;
+                    if (SnapshotCount < 3)
+                    {
+                        SnapshotCount++;
+                    }
+                }
+                LastSeenTicks = nowTicks;
+            }
+        }
+
+        private TaskbarAnchorSettleCandidate _settleCandidate = null;
+
+        internal bool HasPendingSettleCandidate
+        {
+            get { return _settleCandidate != null; }
+        }
+
+        internal Rectangle LastSuccessfulDockedAnchor
+        {
+            get { return _lastSuccessfulDockedAnchor; }
+        }
+
+        internal void ResetSettleCandidate()
+        {
+            _settleCandidate = null;
+        }
+
+        private void InvalidateDockedAnchor()
+        {
+            _lastSuccessfulDockedAnchor = Rectangle.Empty;
+            _lastSuccessfulDockedTaskbarRect = Rectangle.Empty;
+            ResetSettleCandidate();
+        }
+
+        internal bool UseDesktopColor
+        {
+            get { return _useDesktopColor; }
+            set
+            {
+                if (_useDesktopColor != value)
+                {
+                    _useDesktopColor = value;
+                    _lastTaskbarRenderKey = null;
+                }
+            }
+        }
+
+        internal string GetEffectiveDesktopColorHex(int desktopIndex)
+        {
+            if (_desktopColors != null && _desktopColors.ContainsKey(desktopIndex))
+            {
+                return _desktopColors[desktopIndex];
+            }
+            if (desktopIndex > 0 && desktopIndex <= AppConfig.DefaultTintPalette.Length)
+            {
+                return AppConfig.DefaultTintPalette[desktopIndex - 1];
+            }
+            int idx = Math.Max(0, (desktopIndex - 1) % AppConfig.DefaultTintPalette.Length);
+            return AppConfig.DefaultTintPalette[idx];
+        }
+
+        internal Color GetEffectiveDesktopColor(int desktopIndex)
+        {
+            string hex = GetEffectiveDesktopColorHex(desktopIndex);
+            return AppConfig.ParseHexColor(hex, Color.FromArgb(37, 99, 235));
+        }
+
+        private sealed class TaskbarRenderKey : IEquatable<TaskbarRenderKey>
+        {
+            public readonly Rectangle Bounds;
+            public readonly string Title;
+            public readonly string DesktopName;
+            public readonly int CurrentDesktop;
+            public readonly int TotalDesktops;
+            public readonly int OpacityPercent;
+            public readonly byte Alpha;
+            public readonly int Scale;
+            public readonly string ColorTheme;
+            public readonly bool ShowBigNumber;
+            public readonly bool ShowBackgroundCard;
+            public readonly bool IsFloating;
+            public readonly string DisplayTitle;
+            public readonly bool AdaptiveShowBigNumber;
+            public readonly bool AdaptiveShowSeparator;
+            public readonly int AdaptiveMode;
+            public readonly string EffectiveColor;
+
+            public TaskbarRenderKey(
+                Rectangle bounds, string title, string desktopName, int currentDesktop, int totalDesktops,
+                int opacityPercent, byte alpha, int scale, string colorTheme, bool showBigNumber,
+                bool showBackgroundCard, bool isFloating, string displayTitle, bool adaptiveShowBigNumber,
+                bool adaptiveShowSeparator, int adaptiveMode, string effectiveColor)
+            {
+                Bounds = bounds;
+                Title = title ?? string.Empty;
+                DesktopName = desktopName ?? string.Empty;
+                CurrentDesktop = currentDesktop;
+                TotalDesktops = totalDesktops;
+                OpacityPercent = opacityPercent;
+                Alpha = alpha;
+                Scale = scale;
+                ColorTheme = colorTheme ?? string.Empty;
+                ShowBigNumber = showBigNumber;
+                ShowBackgroundCard = showBackgroundCard;
+                IsFloating = isFloating;
+                DisplayTitle = displayTitle ?? string.Empty;
+                AdaptiveShowBigNumber = adaptiveShowBigNumber;
+                AdaptiveShowSeparator = adaptiveShowSeparator;
+                AdaptiveMode = adaptiveMode;
+                EffectiveColor = effectiveColor ?? string.Empty;
+            }
+
+            public bool Equals(TaskbarRenderKey other)
+            {
+                if (ReferenceEquals(null, other)) return false;
+                if (ReferenceEquals(this, other)) return true;
+                return Bounds.Equals(other.Bounds)
+                    && string.Equals(Title, other.Title, StringComparison.Ordinal)
+                    && string.Equals(DesktopName, other.DesktopName, StringComparison.Ordinal)
+                    && CurrentDesktop == other.CurrentDesktop
+                    && TotalDesktops == other.TotalDesktops
+                    && OpacityPercent == other.OpacityPercent
+                    && Alpha == other.Alpha
+                    && Scale == other.Scale
+                    && string.Equals(ColorTheme, other.ColorTheme, StringComparison.Ordinal)
+                    && ShowBigNumber == other.ShowBigNumber
+                    && ShowBackgroundCard == other.ShowBackgroundCard
+                    && IsFloating == other.IsFloating
+                    && string.Equals(DisplayTitle, other.DisplayTitle, StringComparison.Ordinal)
+                    && AdaptiveShowBigNumber == other.AdaptiveShowBigNumber
+                    && AdaptiveShowSeparator == other.AdaptiveShowSeparator
+                    && AdaptiveMode == other.AdaptiveMode
+                    && string.Equals(EffectiveColor, other.EffectiveColor, StringComparison.Ordinal);
+            }
+
+            public override bool Equals(object obj)
+            {
+                return Equals(obj as TaskbarRenderKey);
+            }
+
+            public override int GetHashCode()
+            {
+                unchecked
+                {
+                    int hash = Bounds.GetHashCode();
+                    hash = (hash * 397) ^ (Title != null ? Title.GetHashCode() : 0);
+                    hash = (hash * 397) ^ (DesktopName != null ? DesktopName.GetHashCode() : 0);
+                    hash = (hash * 397) ^ CurrentDesktop;
+                    hash = (hash * 397) ^ TotalDesktops;
+                    hash = (hash * 397) ^ OpacityPercent;
+                    hash = (hash * 397) ^ Alpha.GetHashCode();
+                    hash = (hash * 397) ^ Scale;
+                    hash = (hash * 397) ^ (ColorTheme != null ? ColorTheme.GetHashCode() : 0);
+                    hash = (hash * 397) ^ ShowBigNumber.GetHashCode();
+                    hash = (hash * 397) ^ ShowBackgroundCard.GetHashCode();
+                    hash = (hash * 397) ^ IsFloating.GetHashCode();
+                    hash = (hash * 397) ^ (DisplayTitle != null ? DisplayTitle.GetHashCode() : 0);
+                    hash = (hash * 397) ^ AdaptiveShowBigNumber.GetHashCode();
+                    hash = (hash * 397) ^ AdaptiveShowSeparator.GetHashCode();
+                    hash = (hash * 397) ^ AdaptiveMode;
+                    hash = (hash * 397) ^ (EffectiveColor != null ? EffectiveColor.GetHashCode() : 0);
+                    return hash;
+                }
+            }
+        }
+
+        private TaskbarRenderKey _lastTaskbarRenderKey = null;
+
+        internal Rectangle ActualScreenRect
+        {
+            get { return _actualScreenRect; }
+        }
+
+        internal bool IsTaskbarOverflowFloating
+        {
+            get { return _isTaskbarOverflowFloating; }
+        }
 
         // Dedicated Taskbar Space Provider & Background Monitor
         private ITaskbarSpaceProvider _taskbarSpaceProvider;
@@ -79,11 +344,32 @@ namespace WindicatorPlus
         }
 
         internal byte LastCalculatedAlpha { get; private set; }
+        internal Bitmap LastRenderedBitmapForTest { get; private set; }
+        private bool _captureRenderedBitmapForTesting = false;
+        internal bool CaptureRenderedBitmapForTesting
+        {
+            get { return _captureRenderedBitmapForTesting; }
+            set
+            {
+                if (!_captureRenderedBitmapForTesting && value)
+                {
+                    _lastTaskbarRenderKey = null;
+                }
+                _captureRenderedBitmapForTesting = value;
+            }
+        }
 
         internal bool HasTaskbarIntent
         {
             get { return _isTaskbarDocked; }
-            set { _isTaskbarDocked = value; }
+            set
+            {
+                if (_isTaskbarDocked != value)
+                {
+                    InvalidateDockedAnchor();
+                }
+                _isTaskbarDocked = value;
+            }
         }
 
         internal void TriggerRequestContextMenu()
@@ -119,6 +405,23 @@ namespace WindicatorPlus
         protected override bool ShowWithoutActivation
         {
             get { return true; }
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == RuntimeTrace.WM_WINDOWPOSCHANGED && m.LParam != IntPtr.Zero)
+            {
+                if (RuntimeTrace.IsEnabled)
+                {
+                    try
+                    {
+                        WINDOWPOS wp = (WINDOWPOS)Marshal.PtrToStructure(m.LParam, typeof(WINDOWPOS));
+                        RuntimeTrace.LogWindowPosChanged(wp.hwnd, wp.hwndInsertAfter, wp.x, wp.y, wp.cx, wp.cy, wp.flags);
+                    }
+                    catch { }
+                }
+            }
+            base.WndProc(ref m);
         }
 
         public WatermarkWindow()
@@ -208,6 +511,7 @@ namespace WindicatorPlus
                         BeginInvoke(new Action(() =>
                         {
                             Interlocked.Exchange(ref _isSpaceUpdatePending, 0);
+                            ResetSettleCandidate();
                             if (!_isTaskbarDocked) return;
                             UpdateWatermark();
                         }));
@@ -222,6 +526,27 @@ namespace WindicatorPlus
             {
                 // 契约：fresh 恢复同几何也要触发恢复
                 _lastSnapshotWasFresh = true;
+                if (Interlocked.CompareExchange(ref _isSpaceUpdatePending, 1, 0) == 0)
+                {
+                    try
+                    {
+                        BeginInvoke(new Action(() =>
+                        {
+                            Interlocked.Exchange(ref _isSpaceUpdatePending, 0);
+                            if (!_isTaskbarDocked) return;
+                            UpdateWatermark();
+                        }));
+                    }
+                    catch
+                    {
+                        Interlocked.Exchange(ref _isSpaceUpdatePending, 0);
+                    }
+                }
+            }
+            else if (isFresh && HasPendingSettleCandidate)
+            {
+                // 关键：定时有效快照相同也触发 settle 完成，现有 SpaceChanged 不发相同几何，
+                // 利用现有 150ms freshness guard 只在 pending 时 UI 队列触发并 coalesce，不开新 timer 不 15ms 无差别重画
                 if (Interlocked.CompareExchange(ref _isSpaceUpdatePending, 1, 0) == 0)
                 {
                     try
@@ -294,6 +619,8 @@ namespace WindicatorPlus
         private void MonitorThreadProc()
         {
             bool lastReportedKeyDown = false;
+            bool lastLeftDown = false;
+            bool lastRightDown = false;
 
             while (_isMonitoring)
             {
@@ -301,6 +628,65 @@ namespace WindicatorPlus
                 {
                     Thread.Sleep(50);
                     continue;
+                }
+
+                if (RuntimeTrace.IsEnabled)
+                {
+                    RuntimeTrace.CheckBudget();
+
+                    try
+                    {
+                        bool curLeft = (NativeMethods.GetAsyncKeyState(NativeMethods.VK_LBUTTON) & 0x8000) != 0;
+                        bool curRight = (NativeMethods.GetAsyncKeyState(NativeMethods.VK_RBUTTON) & 0x8000) != 0;
+
+                        if (curLeft != lastLeftDown || curRight != lastRightDown)
+                        {
+                            NativeMethods.POINT pt;
+                            NativeMethods.GetCursorPos(out pt);
+
+                            Rectangle tb = _lastTaskbarRect;
+                            if (tb.IsEmpty)
+                            {
+                                tb = _lastSuccessfulDockedTaskbarRect;
+                            }
+                            if (tb.IsEmpty && _taskbarSpaceProvider != null)
+                            {
+                                var snap = _taskbarSpaceProvider.GetLatestSnapshot();
+                                if (snap != null && !snap.TaskbarRect.IsEmpty)
+                                {
+                                    tb = snap.TaskbarRect;
+                                }
+                            }
+
+                            bool isNearTaskbar = false;
+                            if (!tb.IsEmpty)
+                            {
+                                Rectangle nearTb = new Rectangle(tb.X - 16, tb.Y - 16, tb.Width + 32, tb.Height + 32);
+                                isNearTaskbar = nearTb.Contains(pt.x, pt.y);
+                            }
+
+                            if (curLeft != lastLeftDown)
+                            {
+                                lastLeftDown = curLeft;
+                                if (isNearTaskbar)
+                                {
+                                    IntPtr fgHwnd = RuntimeTrace.GetForegroundWindow();
+                                    RuntimeTrace.LogMouseEvent("left", curLeft ? "down" : "up", pt.x, pt.y, fgHwnd);
+                                }
+                            }
+
+                            if (curRight != lastRightDown)
+                            {
+                                lastRightDown = curRight;
+                                if (isNearTaskbar)
+                                {
+                                    IntPtr fgHwnd = RuntimeTrace.GetForegroundWindow();
+                                    RuntimeTrace.LogMouseEvent("right", curRight ? "down" : "up", pt.x, pt.y, fgHwnd);
+                                }
+                            }
+                        }
+                    }
+                    catch { }
                 }
 
                 // 1. Taskbar Space Freshness Guard:
@@ -427,6 +813,7 @@ namespace WindicatorPlus
                 _isDragging = true;
                 _dragStartMouse = Cursor.Position;
                 _dragStartWin = new Point(Left, Top);
+                InvalidateDockedAnchor();
             }
         }
 
@@ -435,6 +822,7 @@ namespace WindicatorPlus
             base.OnMouseMove(e);
             if (_isDragging)
             {
+                InvalidateDockedAnchor();
                 Point cur = Cursor.Position;
                 int rawX = _dragStartWin.X + (cur.X - _dragStartMouse.X);
                 int rawY = _dragStartWin.Y + (cur.Y - _dragStartMouse.Y);
@@ -525,6 +913,7 @@ namespace WindicatorPlus
             {
                 _isDragging = false;
                 _isSnapped = false;
+                InvalidateDockedAnchor();
                 if (PositionMoved != null)
                 {
                     PositionMoved(Left, Top);
@@ -546,7 +935,11 @@ namespace WindicatorPlus
             {
                 try
                 {
-                    BeginInvoke(new Action(UpdateWatermark));
+                    BeginInvoke(new Action(() =>
+                    {
+                        InvalidateDockedAnchor();
+                        UpdateWatermark();
+                    }));
                 }
                 catch { }
             }
@@ -565,9 +958,24 @@ namespace WindicatorPlus
             _watermarkScale = config.WatermarkScale;
             _titleTemplate = config.TitleTemplate;
             _subtitleTemplate = config.SubtitleTemplate;
+            _showSubtitle = config.ShowSubtitle;
+            _titleFontSize = config.TitleFontSize > 0 ? Math.Max(10, Math.Min(48, config.TitleFontSize)) : 14;
             _showBigNumber = config.ShowBigNumber;
             _showBackgroundCard = config.ShowBackgroundCard;
             _colorTheme = config.WatermarkColorTheme;
+
+            _desktopNames = config.DesktopNames != null
+                ? new Dictionary<int, string>(config.DesktopNames)
+                : new Dictionary<int, string>();
+            _desktopNamesRevision++;
+            InvalidateTaskbarSlotCache();
+            ResetSettleCandidate();
+
+            _useDesktopColor = config.TaskbarTintEnabled;
+            _desktopColors = config.TaskbarTintColors != null
+                ? new Dictionary<int, string>(config.TaskbarTintColors)
+                : new Dictionary<int, string>();
+            _lastTaskbarRenderKey = null;
 
             _desktopName = config.GetDesktopName(_currentDesktop);
 
@@ -580,6 +988,7 @@ namespace WindicatorPlus
             }
             else
             {
+                InvalidateDockedAnchor();
                 ClearLayeredWindow();
                 Hide();
             }
@@ -587,8 +996,13 @@ namespace WindicatorPlus
 
         private void CheckIfPositionIsTaskbarDocked()
         {
+            bool wasDocked = _isTaskbarDocked;
             bool docked = false;
-            if (_position == "Custom" && _customY > 0)
+            if (_position == "Taskbar")
+            {
+                docked = true;
+            }
+            else if (_position == "Custom" && _customY > 0)
             {
                 IntPtr hTaskbar = NativeMethods.FindWindow("Shell_TrayWnd", null);
                 if (hTaskbar != IntPtr.Zero)
@@ -600,15 +1014,57 @@ namespace WindicatorPlus
                         docked = true;
                     }
                 }
+                else if (_taskbarSpaceProvider != null)
+                {
+                    docked = true;
+                }
             }
             _isTaskbarDocked = docked;
+            if (wasDocked != docked)
+            {
+                ResetSettleCandidate();
+            }
         }
 
         public void SetDesktop(int current, int total, string customName)
         {
+            int normalizedTotal = Math.Max(1, total);
+            if (_isEnabled && Visible && !_actualScreenRect.IsEmpty && _currentDesktop == current && _totalDesktops == normalizedTotal && string.Equals(_desktopName, customName, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            if (_totalDesktops != normalizedTotal)
+            {
+                _totalDesktops = normalizedTotal;
+                InvalidateTaskbarSlotCache();
+                ResetSettleCandidate();
+            }
+
             _currentDesktop = current;
-            _totalDesktops = Math.Max(1, total);
             _desktopName = customName;
+
+            if (current > 0)
+            {
+                if (customName != null)
+                {
+                    string existing;
+                    if (!_desktopNames.TryGetValue(current, out existing) || !string.Equals(existing, customName, StringComparison.Ordinal))
+                    {
+                        _desktopNames[current] = customName;
+                        _desktopNamesRevision++;
+                        InvalidateTaskbarSlotCache();
+                    }
+                }
+                else
+                {
+                    if (_desktopNames.Remove(current))
+                    {
+                        _desktopNamesRevision++;
+                        InvalidateTaskbarSlotCache();
+                    }
+                }
+            }
 
             if (_isEnabled)
             {
@@ -619,7 +1075,37 @@ namespace WindicatorPlus
 
         public void SetDesktopName(string name)
         {
+            bool changed = !string.Equals(_desktopName, name, StringComparison.Ordinal);
             _desktopName = name;
+
+            if (_currentDesktop > 0)
+            {
+                if (name != null)
+                {
+                    string existing;
+                    if (!_desktopNames.TryGetValue(_currentDesktop, out existing) || !string.Equals(existing, name, StringComparison.Ordinal))
+                    {
+                        _desktopNames[_currentDesktop] = name;
+                        _desktopNamesRevision++;
+                        changed = true;
+                    }
+                }
+                else
+                {
+                    if (_desktopNames.Remove(_currentDesktop))
+                    {
+                        _desktopNamesRevision++;
+                        changed = true;
+                    }
+                }
+            }
+
+            if (changed)
+            {
+                InvalidateTaskbarSlotCache();
+                ResetSettleCandidate();
+            }
+
             if (_isEnabled && Visible)
             {
                 UpdateWatermark();
@@ -654,6 +1140,8 @@ namespace WindicatorPlus
             }
             _isTaskbarDocked = false;
             _isTaskbarOverflowFloating = false;
+            InvalidateDockedAnchor();
+            ResetSettleCandidate();
             if (_isEnabled && Visible)
             {
                 UpdateWatermark();
@@ -667,12 +1155,21 @@ namespace WindicatorPlus
 
         public void SetDesignerProps(int scale, string titleTpl, string subTpl, bool showBigNum, bool showCard, string colorTheme)
         {
+            SetDesignerProps(scale, titleTpl, subTpl, showBigNum, showCard, colorTheme, _showSubtitle, _titleFontSize);
+        }
+
+        public void SetDesignerProps(int scale, string titleTpl, string subTpl, bool showBigNum, bool showCard, string colorTheme, bool showSubtitle, int titleFontSize = 14)
+        {
             _watermarkScale = Math.Max(70, Math.Min(180, scale));
             _titleTemplate = titleTpl;
             _subtitleTemplate = subTpl;
             _showBigNumber = showBigNum;
             _showBackgroundCard = showCard;
             _colorTheme = colorTheme;
+            _showSubtitle = showSubtitle;
+            _titleFontSize = Math.Max(10, Math.Min(48, titleFontSize));
+            InvalidateTaskbarSlotCache();
+            ResetSettleCandidate();
 
             if (_isEnabled && Visible)
             {
@@ -690,6 +1187,7 @@ namespace WindicatorPlus
             }
             else
             {
+                InvalidateDockedAnchor();
                 ClearLayeredWindow();
                 Hide();
             }
@@ -708,13 +1206,17 @@ namespace WindicatorPlus
             return res;
         }
 
-        private void ClearLayeredWindow()
+        private void ClearLayeredWindow(TaskbarSpaceSnapshot snapshot = null)
         {
+            Rectangle lastActual = _actualScreenRect;
+            _lastTaskbarRenderKey = null;
+            _actualScreenRect = Rectangle.Empty;
             if (!IsHandleCreated) return;
             IntPtr screenDc = IntPtr.Zero;
             IntPtr memDc = IntPtr.Zero;
             IntPtr hBitmap = IntPtr.Zero;
             IntPtr oldBitmap = IntPtr.Zero;
+            bool clearSuccess = false;
             try
             {
                 screenDc = NativeMethods.GetDC(IntPtr.Zero);
@@ -734,7 +1236,7 @@ namespace WindicatorPlus
                     blend.SourceConstantAlpha = 0;
                     blend.AlphaFormat = NativeMethods.AC_SRC_ALPHA;
 
-                    NativeMethods.UpdateLayeredWindow(
+                    clearSuccess = NativeMethods.UpdateLayeredWindow(
                         Handle, screenDc, ref ptDst, ref size, memDc, ref ptSrc, 0, ref blend, NativeMethods.ULW_ALPHA);
                 }
             }
@@ -757,6 +1259,34 @@ namespace WindicatorPlus
                 {
                     NativeMethods.ReleaseDC(IntPtr.Zero, screenDc);
                 }
+
+                if (RuntimeTrace.IsEnabled)
+                {
+                    long snapTicks = snapshot != null ? snapshot.TimestampTicks : 0;
+                    long snapAgeMs = snapshot != null ? ((Stopwatch.GetTimestamp() - snapshot.TimestampTicks) * 1000 / Stopwatch.Frequency) : -1;
+                    bool snapValid = snapshot != null ? snapshot.IsValid : false;
+                    string decision = "clear_layered_window";
+                    if (snapshot != null)
+                    {
+                        decision = !snapshot.IsValid ? "snapshot_invalid" : "snapshot_stale";
+                    }
+
+                    RuntimeTrace.LogWatermarkUpdate(
+                        "clear",
+                        clearSuccess,
+                        decision,
+                        _currentDesktop,
+                        _totalDesktops,
+                        _desktopName,
+                        "",
+                        lastActual,
+                        Rectangle.Empty,
+                        snapTicks,
+                        snapAgeMs,
+                        snapValid,
+                        _isTaskbarDocked,
+                        _isTaskbarOverflowFloating);
+                }
             }
         }
 
@@ -768,23 +1298,27 @@ namespace WindicatorPlus
             Rectangle screenBounds = Screen.PrimaryScreen.Bounds;
 
             string titleText = ParseTemplate(_titleTemplate);
+            Rectangle lastActualBefore = _actualScreenRect;
+            string anchorDecision = _isTaskbarDocked ? "dock_init" : "desktop";
 
             int w, h;
             float scale = _watermarkScale / 100.0f;
             int posX, posY;
 
             TaskbarAdaptiveResult adaptiveResult = default(TaskbarAdaptiveResult);
+            TaskbarSpaceSnapshot snapshot = null;
 
             if (_isTaskbarDocked)
             {
-                TaskbarSpaceSnapshot snapshot = _taskbarSpaceProvider != null ? _taskbarSpaceProvider.GetLatestSnapshot() : null;
+                snapshot = _taskbarSpaceProvider != null ? _taskbarSpaceProvider.GetLatestSnapshot() : null;
 
                 // 契约：失败/过期保守隐藏而不是盖按钮；无taskbar时安全退化
                 if (snapshot == null || !snapshot.IsValid || !snapshot.IsFresh(2000))
                 {
                     _lastSnapshotWasFresh = false;
-                    ClearLayeredWindow();
+                    ClearLayeredWindow(snapshot);
                     _actualScreenRect = Rectangle.Empty;
+                    ResetSettleCandidate();
                     return;
                 }
 
@@ -819,6 +1353,7 @@ namespace WindicatorPlus
                     using (Graphics gMeasure = Graphics.FromImage(measureBmp))
                     {
                         gMeasure.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+                        int stableSlotWidth = GetOrCalculateTaskbarSlotWidth(gMeasure, tbHeight);
                         adaptiveResult = ResolveAdaptiveTaskbarContent(
                             gMeasure,
                             tbHeight,
@@ -826,7 +1361,8 @@ namespace WindicatorPlus
                             _currentDesktop,
                             titleText,
                             _showBigNumber,
-                            availableWidth);
+                            availableWidth,
+                            stableSlotWidth);
                     }
                 }
                 else
@@ -849,16 +1385,134 @@ namespace WindicatorPlus
                     _windowWidth = w;
                     _windowHeight = h;
 
-                    posX = anchorRight - _windowWidth;
-                    posY = tbRect.Top + (tbHeight - _windowHeight) / 2;
+                    int calculatedPosX = anchorRight - _windowWidth;
+                    int calculatedPosY = tbRect.Top + (tbHeight - _windowHeight) / 2;
 
-                    // 迟滞稳定滤波 (Jitter Elimination Filter):
-                    // 若新计算位置与当前屏幕位置差异在 2 像素以内（系统托盘测量或悬停微抖动），严格锁定当前位置，彻底杜绝跳动
-                    if (!_actualScreenRect.IsEmpty && Math.Abs(posX - _actualScreenRect.X) <= 2 && Math.Abs(posY - _actualScreenRect.Y) <= 2)
+                    // 契约：同一TaskbarRect且现有矩形仍在最新安全gap内、尺寸一致且非floating时复用原位置，
+                    // 不再要求相同TrayRect（防隐藏图标展开时跳动）；右侧严格<=anchorRight不能+2；
+                    // 空间真实侵占/尺寸变/屏幕改变立即重新计算
+                    int requiredMinLeft = (maxAppRight > 0) ? (maxAppRight + safetyGap) : (tbRect.Left + safetyGap);
+                    bool canReusePosition = false;
+
+                    // 契约不变量（严格只使用成功ULW记录的停靠锚点）：
+                    // 1. 只使用成功ULW记录的 _lastSuccessfulDockedAnchor，绝不使用 _actualScreenRect 假冒或兜底锚点；
+                    // 2. 强制 tbRect == _lastSuccessfulDockedTaskbarRect 且非空，任何任务栏矩形不一致或未记录均拒绝复用并清理；
+                    // 3. 尺寸一致且通过 fresh snapshot 重新证明上下左右完整安全容纳（无应用遮挡、不侵占托盘区、垂直在任务栏内）；
+                    // 4. 彻底杜绝 2px fallback 在已失效锚点时绕过；未证明复用时严格采用 calculatedPosX/Y。
+                    if (!_lastSuccessfulDockedAnchor.IsEmpty &&
+                        !_lastSuccessfulDockedTaskbarRect.IsEmpty &&
+                        !_wasLastOverflowFloating)
                     {
-                        posX = _actualScreenRect.X;
-                        posY = _actualScreenRect.Y;
+                        if (tbRect != _lastSuccessfulDockedTaskbarRect)
+                        {
+                            // native taskbar 变更或不匹配：立即废弃锚点
+                            InvalidateDockedAnchor();
+                        }
+                        else if (_lastSuccessfulDockedAnchor.Width == _windowWidth &&
+                                 _lastSuccessfulDockedAnchor.Height == _windowHeight)
+                        {
+                            int candLeft = _lastSuccessfulDockedAnchor.Left;
+                            int candRight = _lastSuccessfulDockedAnchor.Right;
+                            int candTop = _lastSuccessfulDockedAnchor.Top;
+                            int candBottom = _lastSuccessfulDockedAnchor.Bottom;
+
+                            // 重新证明上下左右完整安全容纳：
+                            // 水平：左侧 >= requiredMinLeft (不侵占应用区)，右侧 <= anchorRight (不侵占托盘区)
+                            // 垂直：完全在 taskbar 边界内 (Top >= tbRect.Top && Bottom <= tbRect.Bottom)
+                            if (candLeft >= requiredMinLeft && candRight <= anchorRight &&
+                                candTop >= tbRect.Top && candBottom <= tbRect.Bottom)
+                            {
+                                canReusePosition = true;
+                            }
+                            else
+                            {
+                                // 发生真实空间侵占或越界：废弃失效锚点，重新计算
+                                InvalidateDockedAnchor();
+                            }
+                        }
+                        else
+                        {
+                            // 内容尺寸变：不复用旧锚点
+                            InvalidateDockedAnchor();
+                        }
                     }
+
+                    if (canReusePosition)
+                    {
+                        if (calculatedPosX > _lastSuccessfulDockedAnchor.X)
+                        {
+                            // 稳态向右贴近（Settle）判定：
+                            // 只有 same taskbar/full dimensions、latest 安全 gap 允许且 calculatedX > anchorX 时，
+                            // 记录候选目标 (tbRect/TrayRect/slot大小) 和 Stopwatch 时间，
+                            // 连续至少 1500ms 且 >= 3 个严格递增的 snapshot Timestamp 证明稳定，才右移一次到 desiredX；
+                            // 候选最多计数3次不无限增长，时间戳非严格递增不计数，观测间隔 > 2s 需重置防长停顿当连续稳定；
+                            // 托盘变或新目标重新计时；空间入侵立即安全左移。
+                            long nowTicks = GetCurrentMonotonicTicks();
+                            long currentSnapTimestamp = snapshot != null ? snapshot.TimestampTicks : 0;
+
+                            bool needsNewCandidate = (_settleCandidate == null || !_settleCandidate.Matches(tbRect, trRect, _windowWidth, _windowHeight, calculatedPosX));
+                            if (!needsNewCandidate)
+                            {
+                                long gapTicks = nowTicks - _settleCandidate.LastSeenTicks;
+                                long gapMs = Stopwatch.Frequency > 0 ? (gapTicks * 1000) / Stopwatch.Frequency : 0;
+                                if (gapTicks < 0 || gapMs > 2000)
+                                {
+                                    needsNewCandidate = true;
+                                }
+                            }
+
+                            if (needsNewCandidate)
+                            {
+                                anchorDecision = "dock_settle_init";
+                                _settleCandidate = new TaskbarAnchorSettleCandidate(tbRect, trRect, _windowWidth, _windowHeight, calculatedPosX, nowTicks, currentSnapTimestamp);
+                                posX = _lastSuccessfulDockedAnchor.X;
+                                posY = _lastSuccessfulDockedAnchor.Y;
+                            }
+                            else
+                            {
+                                _settleCandidate.RecordSnapshot(nowTicks, currentSnapTimestamp);
+
+                                long elapsedTicks = nowTicks - _settleCandidate.FirstSeenTicks;
+                                long elapsedMs = Stopwatch.Frequency > 0 ? (elapsedTicks * 1000) / Stopwatch.Frequency : 0;
+
+                                if (elapsedTicks >= 0 && elapsedMs >= 1500 && _settleCandidate.SnapshotCount >= 3)
+                                {
+                                    // 稳定证明充分：右移一次到 desiredX
+                                    anchorDecision = "dock_settle_moved";
+                                    _settleCandidate = null;
+                                    posX = calculatedPosX;
+                                    posY = calculatedPosY;
+                                }
+                                else
+                                {
+                                    // 尚未满足稳定阈值：保持旧锚点防止跳动
+                                    anchorDecision = "dock_settle_holding";
+                                    posX = _lastSuccessfulDockedAnchor.X;
+                                    posY = _lastSuccessfulDockedAnchor.Y;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // 已贴近或无需右移：清空 settle 候选
+                            anchorDecision = "dock_reuse_anchor";
+                            ResetSettleCandidate();
+                            posX = _lastSuccessfulDockedAnchor.X;
+                            posY = _lastSuccessfulDockedAnchor.Y;
+                        }
+                    }
+                    else
+                    {
+                        // 空间入侵/尺寸变更/无法复用原锚点：立即采用最新安全计算位置（安全左移），并清理候选
+                        anchorDecision = "dock_safe_left_shift_or_recalc";
+                        ResetSettleCandidate();
+                        posX = calculatedPosX;
+                        posY = calculatedPosY;
+                    }
+
+                    _lastTaskbarRect = tbRect;
+                    _lastTrayRect = trRect;
+                    _wasLastOverflowFloating = false;
 
                     _customX = posX;
                     _customY = posY;
@@ -869,6 +1523,7 @@ namespace WindicatorPlus
                     // DO NOT disappear! Float right above the taskbar top edge so the user NEVER loses the watermark,
                     // and taskbar app buttons (ChatGPT, pi, etc.) remain 100% unobstructed.
                     _isTaskbarOverflowFloating = true;
+                    InvalidateDockedAnchor();
 
                     using (Bitmap measureBmp = new Bitmap(1, 1))
                     using (Graphics gMeasure = Graphics.FromImage(measureBmp))
@@ -907,23 +1562,49 @@ namespace WindicatorPlus
                     if (posX < workArea.Left + 16) posX = workArea.Left + 16;
 
                     posY = (tbRect.Top > 0 ? tbRect.Top : workArea.Bottom) - _windowHeight - 8;
+
+                    _lastTaskbarRect = tbRect;
+                    _lastTrayRect = trRect;
+                    _wasLastOverflowFloating = true;
+                    anchorDecision = "dock_overflow_floating";
                 }
             }
             else
             {
+                // 非任务栏（桌面水印）渲染清 _lastTaskbarRenderKey，确保离开再回到 taskbar 重新提交
+                _lastTaskbarRenderKey = null;
+                InvalidateDockedAnchor();
+
                 int baseW = 240;
                 int baseH = 88;
                 if (_style == "Minimal") { baseW = 160; baseH = 130; }
                 else if (_style == "Badge") { baseW = 190; baseH = 54; }
                 else if (_style == "TextZh" || _style == "TextEn") { baseW = 220; baseH = 76; }
 
-                if (!string.IsNullOrEmpty(titleText) && titleText.Length > 4)
-                {
-                    baseW += Math.Min(160, (titleText.Length - 4) * 16);
-                }
+                string subText = ParseTemplate(_subtitleTemplate);
 
-                w = Math.Max(100, (int)(baseW * scale));
-                h = Math.Max(40, (int)(baseH * scale));
+                if (_style == "Card")
+                {
+                    Size cardSz = CalculateCardWindowSize(scale, _currentDesktop, titleText, subText, _showBigNumber, _showSubtitle, _titleFontSize);
+                    w = cardSz.Width;
+                    h = cardSz.Height;
+                }
+                else if (_style == "TextZh" || _style == "TextEn")
+                {
+                    Size textSize = CalculateCardWindowSize(scale, _currentDesktop, titleText, subText, false, _showSubtitle, _titleFontSize);
+                    w = textSize.Width;
+                    h = textSize.Height;
+                }
+                else
+                {
+                    if (!string.IsNullOrEmpty(titleText) && titleText.Length > 4)
+                    {
+                        baseW += Math.Min(160, (titleText.Length - 4) * 16);
+                    }
+
+                    w = Math.Max(100, (int)(baseW * scale));
+                    h = Math.Max(40, (int)(baseH * scale));
+                }
 
                 _windowWidth = w;
                 _windowHeight = h;
@@ -963,14 +1644,18 @@ namespace WindicatorPlus
             // 避免 water 自身每 render 无条件 raise 破坏任务栏层级链，任务栏层级由协调器拥有；desktop watermark 正常独立 topmost 保留
             if (!_isContextMenuOpen && !_isTaskbarDocked)
             {
-                NativeMethods.SetWindowPos(
-                    Handle,
-                    NativeMethods.HWND_TOPMOST,
-                    0,
-                    0,
-                    0,
-                    0,
-                    NativeMethods.SWP_NOMOVE | NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOACTIVATE | NativeMethods.SWP_SHOWWINDOW);
+                int exStyle = NativeMethods.GetWindowLong(Handle, NativeMethods.GWL_EXSTYLE);
+                if ((exStyle & NativeMethods.WS_EX_TOPMOST) == 0)
+                {
+                    NativeMethods.SetWindowPos(
+                        Handle,
+                        NativeMethods.HWND_TOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        NativeMethods.SWP_NOMOVE | NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOACTIVATE);
+                }
             }
 
             byte alpha = (byte)(_opacityPercent * 255 / 100);
@@ -980,6 +1665,40 @@ namespace WindicatorPlus
             }
             LastCalculatedAlpha = alpha;
 
+            TaskbarRenderKey currentKey = null;
+            if (_isTaskbarDocked)
+            {
+                string effectiveColorHex = _useDesktopColor ? GetEffectiveDesktopColorHex(_currentDesktop) : string.Empty;
+                currentKey = new TaskbarRenderKey(
+                    new Rectangle(posX, posY, _windowWidth, _windowHeight),
+                    titleText,
+                    _desktopName,
+                    _currentDesktop,
+                    _totalDesktops,
+                    _opacityPercent,
+                    alpha,
+                    _watermarkScale,
+                    _colorTheme,
+                    _showBigNumber,
+                    _showBackgroundCard,
+                    _isTaskbarOverflowFloating,
+                    adaptiveResult.DisplayTitle,
+                    adaptiveResult.ShowBigNumber,
+                    adaptiveResult.ShowSeparator,
+                    (int)adaptiveResult.Mode,
+                    effectiveColorHex
+                );
+
+                // 契约：任务栏渲染在布局完成后对最终bounds/content/opacity/scale/theme/number/background/floating状态做精确key；
+                // 仅成功ULW后缓存；相同状态直接return不重复GDI/ULW；ClearLayeredWindow和Handle销毁清缓存，测试捕获开关变化要允许出图。
+                // 不缓存桌面Glow，不缓存failed submission。
+                bool needsTestCapture = CaptureRenderedBitmapForTesting && LastRenderedBitmapForTest == null;
+                if (!needsTestCapture && _lastTaskbarRenderKey != null && _lastTaskbarRenderKey.Equals(currentKey))
+                {
+                    return;
+                }
+            }
+
             using (Bitmap bmp = new Bitmap(_windowWidth, _windowHeight, PixelFormat.Format32bppArgb))
             {
                 using (Graphics g = Graphics.FromImage(bmp))
@@ -987,7 +1706,9 @@ namespace WindicatorPlus
                     g.SmoothingMode = SmoothingMode.AntiAlias;
                     g.TextRenderingHint = _isTaskbarDocked ? TextRenderingHint.AntiAliasGridFit : TextRenderingHint.ClearTypeGridFit;
                     g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                    g.Clear(Color.Transparent);
+                    // 任务栏模式下整个 widget 矩形预填 Alpha=1 黑色底（肉眼不可察无可见边框），阻止 OS 将透明区域视为穿透
+                    // 桌面水印模式仍使用完全 Alpha=0 透明背景，保持 100% 桌面背景穿透
+                    g.Clear(_isTaskbarDocked ? Color.FromArgb(1, 0, 0, 0) : Color.Transparent);
 
                     if (_isTaskbarDocked)
                     {
@@ -1000,7 +1721,17 @@ namespace WindicatorPlus
                                 {
                                     g.FillPath(bgBrush, path);
                                 }
-                                using (Pen borderPen = new Pen(Color.FromArgb(150, 139, 92, 246), 1.2f))
+                                Color floatBorderColor;
+                                if (_useDesktopColor)
+                                {
+                                    Color effClr = GetEffectiveDesktopColor(_currentDesktop);
+                                    floatBorderColor = Color.FromArgb(150, effClr.R, effClr.G, effClr.B);
+                                }
+                                else
+                                {
+                                    floatBorderColor = Color.FromArgb(150, 139, 92, 246);
+                                }
+                                using (Pen borderPen = new Pen(floatBorderColor, 1.2f))
                                 {
                                     g.DrawPath(borderPen, path);
                                 }
@@ -1041,6 +1772,7 @@ namespace WindicatorPlus
                 bool ulwSuccess = false;
                 try
                 {
+                    if (_isTaskbarDocked) ApplyTaskbarPixelOpacity(bmp, alpha);
                     screenDc = NativeMethods.GetDC(IntPtr.Zero);
                     memDc = NativeMethods.CreateCompatibleDC(screenDc);
                     hBitmap = bmp.GetHbitmap(Color.FromArgb(0));
@@ -1053,7 +1785,9 @@ namespace WindicatorPlus
                     NativeMethods.BLENDFUNCTION blend = new NativeMethods.BLENDFUNCTION();
                     blend.BlendOp = NativeMethods.AC_SRC_OVER;
                     blend.BlendFlags = 0;
-                    blend.SourceConstantAlpha = alpha;
+                    // 任务栏模式下固定 SourceConstantAlpha 为 255，保障 alpha1 底色的有效 alpha 恒保持 nonzero (1*255/255=1)，彻底杜绝 OS 命中截断穿透
+                    // 桌面水印模式使用配置透明度 alpha 进行半透明合成
+                    blend.SourceConstantAlpha = _isTaskbarDocked ? (byte)255 : alpha;
                     blend.AlphaFormat = NativeMethods.AC_SRC_ALPHA;
 
                     ulwSuccess = NativeMethods.UpdateLayeredWindow(
@@ -1062,6 +1796,24 @@ namespace WindicatorPlus
                     if (ulwSuccess)
                     {
                         _actualScreenRect = new Rectangle(posX, posY, _windowWidth, _windowHeight);
+                        if (_isTaskbarDocked)
+                        {
+                            _lastTaskbarRenderKey = currentKey;
+                            if (!_isTaskbarOverflowFloating)
+                            {
+                                _lastSuccessfulDockedAnchor = _actualScreenRect;
+                                _lastSuccessfulDockedTaskbarRect = _lastTaskbarRect;
+                            }
+                        }
+                        if (CaptureRenderedBitmapForTesting) try
+                        {
+                            if (LastRenderedBitmapForTest != null)
+                            {
+                                LastRenderedBitmapForTest.Dispose();
+                            }
+                            LastRenderedBitmapForTest = (Bitmap)bmp.Clone();
+                        }
+                        catch { }
                     }
                 }
                 finally
@@ -1082,6 +1834,29 @@ namespace WindicatorPlus
                     {
                         NativeMethods.ReleaseDC(IntPtr.Zero, screenDc);
                     }
+                }
+
+                if (RuntimeTrace.IsEnabled)
+                {
+                    long snapTicks = snapshot != null ? snapshot.TimestampTicks : 0;
+                    long snapAgeMs = snapshot != null ? ((Stopwatch.GetTimestamp() - snapshot.TimestampTicks) * 1000 / Stopwatch.Frequency) : -1;
+                    bool snapValid = snapshot != null ? snapshot.IsValid : false;
+
+                    RuntimeTrace.LogWatermarkUpdate(
+                        "render",
+                        ulwSuccess,
+                        anchorDecision,
+                        _currentDesktop,
+                        _totalDesktops,
+                        _desktopName,
+                        titleText,
+                        lastActualBefore,
+                        new Rectangle(posX, posY, _windowWidth, _windowHeight),
+                        snapTicks,
+                        snapAgeMs,
+                        snapValid,
+                        _isTaskbarDocked,
+                        _isTaskbarOverflowFloating);
                 }
             }
         }
@@ -1177,6 +1952,27 @@ namespace WindicatorPlus
             bool showBigNumber,
             int availableWidth)
         {
+            return ResolveAdaptiveTaskbarContent(
+                g,
+                taskbarHeight,
+                watermarkScale,
+                currentDesktop,
+                fullTitleText,
+                showBigNumber,
+                availableWidth,
+                0);
+        }
+
+        public static TaskbarAdaptiveResult ResolveAdaptiveTaskbarContent(
+            Graphics g,
+            int taskbarHeight,
+            int watermarkScale,
+            int currentDesktop,
+            string fullTitleText,
+            bool showBigNumber,
+            int availableWidth,
+            int stableSlotWidth)
+        {
             if (availableWidth <= 0)
             {
                 return new TaskbarAdaptiveResult
@@ -1194,13 +1990,19 @@ namespace WindicatorPlus
 
                 if (layoutFull.Width <= availableWidth)
                 {
+                    int targetWidth = layoutFull.Width;
+                    if (stableSlotWidth > 0 && availableWidth >= stableSlotWidth)
+                    {
+                        targetWidth = Math.Max(stableSlotWidth, layoutFull.Width);
+                    }
+
                     return new TaskbarAdaptiveResult
                     {
                         IsVisible = true,
                         DisplayTitle = fullTitleText,
                         ShowBigNumber = showBigNumber,
                         ShowSeparator = showBigNumber,
-                        Width = layoutFull.Width,
+                        Width = targetWidth,
                         Height = layoutFull.Height,
                         Layout = layoutFull,
                         Mode = TaskbarAdaptiveMode.Full
@@ -1249,13 +2051,19 @@ namespace WindicatorPlus
 
                 if (numLayout.Width <= availableWidth)
                 {
+                    int targetWidth = numLayout.Width;
+                    if (string.IsNullOrEmpty(fullTitleText) && stableSlotWidth > 0 && availableWidth >= stableSlotWidth)
+                    {
+                        targetWidth = Math.Max(stableSlotWidth, numLayout.Width);
+                    }
+
                     return new TaskbarAdaptiveResult
                     {
                         IsVisible = true,
                         DisplayTitle = "",
                         ShowBigNumber = true,
                         ShowSeparator = false, // 严格不显示孤立分隔符
-                        Width = numLayout.Width,
+                        Width = targetWidth,
                         Height = numLayout.Height,
                         Layout = numLayout,
                         Mode = TaskbarAdaptiveMode.NumberOnly
@@ -1269,6 +2077,136 @@ namespace WindicatorPlus
                 IsVisible = false,
                 Mode = TaskbarAdaptiveMode.Hidden
             };
+        }
+
+        internal static int CalculateTaskbarStableSlotWidthCore(
+            Graphics g,
+            int taskbarHeight,
+            int watermarkScale,
+            int totalDesktops,
+            int currentDesktop,
+            string currentCustomName,
+            string titleTemplate,
+            bool showBigNumber,
+            IDictionary<int, string> desktopNames)
+        {
+            if (taskbarHeight <= 0) taskbarHeight = 48;
+            int maxTotal = Math.Max(1, totalDesktops);
+
+            HashSet<int> indices = new HashSet<int>();
+            for (int i = 1; i <= maxTotal; i++)
+            {
+                indices.Add(i);
+            }
+            if (currentDesktop > 0)
+            {
+                indices.Add(currentDesktop);
+            }
+            if (desktopNames != null)
+            {
+                foreach (var kvp in desktopNames)
+                {
+                    if (kvp.Key > 0)
+                    {
+                        indices.Add(kvp.Key);
+                    }
+                }
+            }
+
+            int maxSlotWidth = 0;
+            string tpl = titleTemplate ?? "";
+
+            foreach (int idx in indices)
+            {
+                string name;
+                string dictName;
+                if (currentDesktop > 0 && idx == currentDesktop)
+                {
+                    name = currentCustomName;
+                }
+                else if (desktopNames != null && desktopNames.TryGetValue(idx, out dictName) && dictName != null)
+                {
+                    name = dictName;
+                }
+                else
+                {
+                    name = null;
+                }
+
+                string curName = string.IsNullOrEmpty(name) ? ("桌面 " + idx) : name;
+
+                string titleText = tpl;
+                titleText = titleText.Replace("{n}", idx.ToString());
+                titleText = titleText.Replace("{index}", idx.ToString());
+                titleText = titleText.Replace("{total}", maxTotal.ToString());
+                titleText = titleText.Replace("{name}", curName);
+
+                bool showSep = showBigNumber && !string.IsNullOrEmpty(titleText);
+                TaskbarWidgetLayout layout = CalculateTaskbarLayoutCore(
+                    g, taskbarHeight, titleText, showBigNumber, showSep, watermarkScale, idx);
+
+                if (layout.Width > maxSlotWidth)
+                {
+                    maxSlotWidth = layout.Width;
+                }
+            }
+
+            return maxSlotWidth;
+        }
+
+        internal static int CalculateTaskbarStableSlotWidthCore(
+            Graphics g,
+            int taskbarHeight,
+            int watermarkScale,
+            int totalDesktops,
+            string titleTemplate,
+            bool showBigNumber,
+            IDictionary<int, string> desktopNames)
+        {
+            return CalculateTaskbarStableSlotWidthCore(
+                g,
+                taskbarHeight,
+                watermarkScale,
+                totalDesktops,
+                0,
+                null,
+                titleTemplate,
+                showBigNumber,
+                desktopNames);
+        }
+
+        private int GetOrCalculateTaskbarSlotWidth(Graphics g, int tbHeight)
+        {
+            if (_isSlotCacheValid &&
+                _cachedSlotTbHeight == tbHeight &&
+                _cachedSlotScale == _watermarkScale &&
+                _cachedSlotShowBigNumber == _showBigNumber &&
+                _cachedSlotTotal == _totalDesktops &&
+                string.Equals(_cachedSlotTemplate, _titleTemplate, StringComparison.Ordinal) &&
+                _cachedSlotNamesRevision == _desktopNamesRevision)
+            {
+                return _cachedSlotWidth;
+            }
+
+            int width = CalculateTaskbarStableSlotWidthCore(
+                g,
+                tbHeight,
+                _watermarkScale,
+                _totalDesktops,
+                _titleTemplate,
+                _showBigNumber,
+                _desktopNames);
+
+            _cachedSlotWidth = width;
+            _cachedSlotTbHeight = tbHeight;
+            _cachedSlotScale = _watermarkScale;
+            _cachedSlotShowBigNumber = _showBigNumber;
+            _cachedSlotTotal = _totalDesktops;
+            _cachedSlotTemplate = _titleTemplate;
+            _cachedSlotNamesRevision = _desktopNamesRevision;
+            _isSlotCacheValid = true;
+
+            return _cachedSlotWidth;
         }
 
         private TaskbarWidgetLayout CalculateTaskbarLayout(Graphics g, int taskbarHeight, string titleText)
@@ -1373,6 +2311,37 @@ namespace WindicatorPlus
         }
 
         // Transparent overlay single-line widget: "数字 | 开发调试" (no background, no border, no subtitle/counter/drag-hint)
+        internal static void ApplyTaskbarPixelOpacity(Bitmap bitmap, byte opacity)
+        {
+            // Bake user opacity into the pixels, retaining alpha=1 in blank hit-area pixels.
+            // SourceConstantAlpha must stay 255 so Windows does not round the hit surface to zero.
+            BitmapData data = bitmap.LockBits(new Rectangle(0, 0, bitmap.Width, bitmap.Height), ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+            try
+            {
+                byte[] row = new byte[bitmap.Width * 4];
+                for (int y = 0; y < bitmap.Height; y++)
+                {
+                    IntPtr address = IntPtr.Add(data.Scan0, y * data.Stride);
+                    System.Runtime.InteropServices.Marshal.Copy(address, row, 0, row.Length);
+                    for (int x = 3; x < row.Length; x += 4)
+                        row[x] = (byte)Math.Max(1, (row[x] * opacity + 127) / 255);
+                    System.Runtime.InteropServices.Marshal.Copy(row, 0, address, row.Length);
+                }
+            }
+            finally { bitmap.UnlockBits(data); }
+        }
+
+        internal static float CalculateTaskbarContentHorizontalOffset(int targetWidth, int layoutWidth, bool isNonOverflowTaskbar)
+        {
+            if (!isNonOverflowTaskbar) return 0f;
+            return Math.Max(0f, (float)(targetWidth - layoutWidth));
+        }
+
+        internal static float CalculateTaskbarContentHorizontalOffset(int targetWidth, int layoutWidth, bool isTaskbarDocked, bool isTaskbarOverflowFloating)
+        {
+            return CalculateTaskbarContentHorizontalOffset(targetWidth, layoutWidth, isTaskbarDocked && !isTaskbarOverflowFloating);
+        }
+
         private void RenderTaskbarDockedWidget(Graphics g, int w, int h, string titleText)
         {
             bool showSep = _showBigNumber && !string.IsNullOrEmpty(titleText);
@@ -1381,39 +2350,139 @@ namespace WindicatorPlus
 
         internal void RenderTaskbarDockedWidgetCore(Graphics g, int w, int h, string titleText, bool showBigNumber, bool showSeparator)
         {
+            bool isNonOverflow = _isTaskbarDocked && !_isTaskbarOverflowFloating;
+            RenderTaskbarDockedWidgetCore(g, w, h, titleText, showBigNumber, showSeparator, isNonOverflow);
+        }
+
+        internal void RenderTaskbarDockedWidgetCore(Graphics g, int w, int h, string titleText, bool showBigNumber, bool showSeparator, bool isNonOverflowTaskbar)
+        {
             g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
 
-            TaskbarWidgetLayout layout = CalculateTaskbarLayoutCore(g, h, titleText, showBigNumber, showSeparator, _watermarkScale, _currentDesktop);
+            int effectiveScale = _watermarkScale > 0 ? _watermarkScale : 100;
+            int effectiveDesktop = _currentDesktop > 0 ? _currentDesktop : 1;
+            TaskbarWidgetLayout layout = CalculateTaskbarLayoutCore(g, h, titleText, showBigNumber, showSeparator, effectiveScale, effectiveDesktop);
 
-            string numText = _currentDesktop.ToString();
+            float offsetX = CalculateTaskbarContentHorizontalOffset(w, layout.Width, isNonOverflowTaskbar);
+
+            string numText = effectiveDesktop.ToString();
+
+            Color effectiveColor = _useDesktopColor ? GetEffectiveDesktopColor(effectiveDesktop) : Color.White;
 
             using (Font numFont = new Font("Segoe UI Variable Display", layout.NumFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
             using (Font titleFont = new Font("Microsoft YaHei UI", layout.TitleFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
-            using (SolidBrush shadowBrush = new SolidBrush(Color.FromArgb(220, 0, 0, 0)))
-            using (SolidBrush whiteBrush = new SolidBrush(Color.White))
             using (StringFormat sf = StringFormat.GenericTypographic)
             {
                 if (showBigNumber)
                 {
-                    g.DrawString(numText, numFont, shadowBrush, new PointF(layout.NumX + 1f, layout.NumY + 1f), sf);
-                    g.DrawString(numText, numFont, whiteBrush, new PointF(layout.NumX, layout.NumY), sf);
+                    DrawTaskbarLuminousText(g, numText, numFont, new PointF(layout.NumX + offsetX, layout.NumY), sf, effectiveColor);
 
                     if (showSeparator)
                     {
                         float penWidth = Math.Max(1.0f, layout.DpiScale >= 1.5f ? 1.5f : 1.0f);
-                        using (Pen sepPen = new Pen(Color.FromArgb(120, 255, 255, 255), penWidth))
-                        {
-                            g.DrawLine(sepPen, layout.SepX, layout.SepY1, layout.SepX, layout.SepY2);
-                        }
+                        DrawTaskbarLuminousSeparator(g, layout.SepX + offsetX, layout.SepY1, layout.SepY2, penWidth, effectiveColor);
                     }
                 }
 
                 if (!string.IsNullOrEmpty(titleText))
                 {
-                    g.DrawString(titleText, titleFont, shadowBrush, new PointF(layout.TitleX + 1f, layout.TitleY + 1f), sf);
-                    g.DrawString(titleText, titleFont, whiteBrush, new PointF(layout.TitleX, layout.TitleY), sf);
+                    DrawTaskbarLuminousText(g, titleText, titleFont, new PointF(layout.TitleX + offsetX, layout.TitleY), sf, effectiveColor);
                 }
             }
+        }
+
+        internal static void DrawTaskbarLuminousText(Graphics g, string text, Font font, PointF point, StringFormat format, Color baseColor)
+        {
+            if (string.IsNullOrEmpty(text)) return;
+
+            bool isDark = baseColor.GetBrightness() < 0.25f || (baseColor.R < 35 && baseColor.G < 35 && baseColor.B < 35);
+            bool isWhite = baseColor.R > 235 && baseColor.G > 235 && baseColor.B > 235;
+
+            Color glowColor;
+            Color coreColor;
+
+            if (isDark)
+            {
+                // 暗曜石：纯黑/深曜石字芯 + 冰晶透亮冷白微光晕
+                glowColor = Color.FromArgb(210, 235, 255);
+                coreColor = Color.FromArgb(18, 18, 22);
+            }
+            else if (isWhite)
+            {
+                // 白金纯白：纯白字芯 + 柔和纯净白银微光晕
+                glowColor = Color.FromArgb(240, 245, 255);
+                coreColor = Color.White;
+            }
+            else
+            {
+                // 彩色霓虹：饱满同色光晕 + 鲜亮发光字芯
+                glowColor = baseColor;
+                coreColor = BrightenColor(baseColor, 1.25f);
+            }
+
+            // 1. 底层微阴影（增强立体悬浮感，防浅色背景）
+            using (SolidBrush shadowBrush = new SolidBrush(Color.FromArgb(100, 0, 0, 0)))
+            {
+                g.DrawString(text, font, shadowBrush, point.X + 0.8f, point.Y + 1.2f, format);
+            }
+
+            // 2. 外层扩散光晕 (半径 2.0px，8 方向匀称扩散)
+            int outerAlpha = isDark ? 45 : 35;
+            using (SolidBrush bOuter = new SolidBrush(Color.FromArgb(outerAlpha, glowColor.R, glowColor.G, glowColor.B)))
+            {
+                DrawCircularOffsets(g, text, font, bOuter, point.X, point.Y, format, 2.0f, 8);
+            }
+
+            // 3. 紧凑致密光环 (半径 1.0px，8 方向，清晰勾勒笔画自发光感)
+            int innerAlpha = isDark ? 160 : 95;
+            using (SolidBrush bInner = new SolidBrush(Color.FromArgb(innerAlpha, glowColor.R, glowColor.G, glowColor.B)))
+            {
+                DrawCircularOffsets(g, text, font, bInner, point.X, point.Y, format, 1.0f, 8);
+            }
+
+            // 4. 字芯前景
+            using (SolidBrush coreBrush = new SolidBrush(coreColor))
+            {
+                g.DrawString(text, font, coreBrush, point.X, point.Y, format);
+            }
+        }
+
+        private static void DrawTaskbarLuminousSeparator(Graphics g, float sepX, float y1, float y2, float penWidth, Color baseColor)
+        {
+            bool isDark = baseColor.GetBrightness() < 0.25f || (baseColor.R < 35 && baseColor.G < 35 && baseColor.B < 35);
+            bool isWhite = baseColor.R > 235 && baseColor.G > 235 && baseColor.B > 235;
+
+            Color glowColor = isDark ? Color.FromArgb(210, 235, 255) : (isWhite ? Color.FromArgb(240, 245, 255) : baseColor);
+            Color coreColor = isDark ? Color.FromArgb(180, 210, 235, 255) : (isWhite ? Color.FromArgb(180, 255, 255, 255) : BrightenColor(baseColor, 1.25f));
+
+            // 外微光
+            using (Pen sepGlow = new Pen(Color.FromArgb(50, glowColor.R, glowColor.G, glowColor.B), penWidth + 1.6f))
+            {
+                g.DrawLine(sepGlow, sepX, y1 - 0.5f, sepX, y2 + 0.5f);
+            }
+            // 亮心线
+            using (Pen sepSolid = new Pen(Color.FromArgb(180, coreColor.R, coreColor.G, coreColor.B), penWidth))
+            {
+                g.DrawLine(sepSolid, sepX, y1, sepX, y2);
+            }
+        }
+
+        private static void DrawCircularOffsets(Graphics g, string text, Font font, Brush brush, float cx, float cy, StringFormat sf, float radius, int count)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                double angle = (2.0 * Math.PI / count) * i;
+                float ox = cx + (float)(Math.Cos(angle) * radius);
+                float oy = cy + (float)(Math.Sin(angle) * radius);
+                g.DrawString(text, font, brush, ox, oy, sf);
+            }
+        }
+
+        private static Color BrightenColor(Color c, float factor)
+        {
+            int r = Math.Min(255, (int)(c.R * factor + (255 - c.R) * 0.18f));
+            int g = Math.Min(255, (int)(c.G * factor + (255 - c.G) * 0.18f));
+            int b = Math.Min(255, (int)(c.B * factor + (255 - c.B) * 0.18f));
+            return Color.FromArgb(c.A, r, g, b);
         }
 
         private void RenderBreathingGlow(Graphics g, int w, int h)
@@ -1482,29 +2551,274 @@ namespace WindicatorPlus
                 cardBgColor = Color.FromArgb(180, 14, 18, 26);
                 borderPenColor = Color.FromArgb(220, 255, 255, 255);
             }
+
+            if (_useDesktopColor)
+            {
+                Color tintColor = GetEffectiveDesktopColor(_currentDesktop);
+                titleColor = Color.FromArgb(255, tintColor.R, tintColor.G, tintColor.B);
+                numColor = Color.FromArgb(255, tintColor.R, tintColor.G, tintColor.B);
+                subColor = Color.FromArgb(subColor.A, tintColor.R, tintColor.G, tintColor.B);
+                borderPenColor = Color.FromArgb(borderPenColor.A, tintColor.R, tintColor.G, tintColor.B);
+                // cardBgColor 不变
+            }
+        }
+
+        internal struct CardLayoutResult
+        {
+            public Rectangle CardRect;
+            public bool ShowBigNumber;
+            public RectangleF NumAreaRect;
+            public PointF NumDrawPoint;
+            public RectangleF NumGlyphBounds;
+            public bool ShowSeparator;
+            public float SepX;
+            public float SepY1;
+            public float SepY2;
+            public RectangleF ContentAreaRect;
+            public bool HasSubtitle;
+            public PointF TitleDrawPoint;
+            public RectangleF TitleGlyphBounds;
+            public PointF SubDrawPoint;
+            public RectangleF SubGlyphBounds;
+        }
+
+        public static RectangleF MeasureGlyphBounds(string text, Font font, StringFormat sf = null)
+        {
+            if (string.IsNullOrEmpty(text)) return RectangleF.Empty;
+            using (GraphicsPath path = new GraphicsPath())
+            {
+                path.AddString(text, font.FontFamily, (int)font.Style, font.Size, Point.Empty, sf ?? StringFormat.GenericTypographic);
+                return path.GetBounds();
+            }
+        }
+
+        internal static CardLayoutResult CalculateCardLayoutCore(
+            int w,
+            int h,
+            float scale,
+            int currentDesktop,
+            string titleText,
+            string subText,
+            bool showBigNumber,
+            bool showSubtitle,
+            int titleFontSizeLogic)
+        {
+            CardLayoutResult res = new CardLayoutResult();
+            res.CardRect = new Rectangle(4, 4, w - 8, h - 8);
+            res.ShowBigNumber = showBigNumber;
+
+            string numText = currentDesktop.ToString();
+            int numFontSize = Math.Max(12, (int)(48 * scale));
+            int actualTitleFontSize = Math.Max(10, Math.Min(48, titleFontSizeLogic > 0 ? titleFontSizeLogic : 14));
+            int titleFontSize = Math.Max(8, (int)(actualTitleFontSize * scale));
+            int subFontSize = Math.Max(8, (int)(11 * scale));
+
+            using (StringFormat sf = StringFormat.GenericTypographic)
+            using (Font numFont = new Font("Segoe UI Variable Display", numFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (Font titleFont = new Font("Microsoft YaHei UI", titleFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (Font subFont = new Font("Microsoft YaHei UI", subFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
+            {
+                float sepX = 0;
+                if (showBigNumber)
+                {
+                    RectangleF rawNumBounds = MeasureGlyphBounds(numText, numFont, sf);
+                    sepX = (int)((numText.Length > 1 ? 98 : 78) * scale);
+                    if (sepX < res.CardRect.Left + rawNumBounds.Width + 20 * scale)
+                    {
+                        sepX = (float)Math.Ceiling(res.CardRect.Left + rawNumBounds.Width + 20 * scale);
+                    }
+
+                    res.SepX = sepX;
+                    res.SepY1 = (int)(16 * scale);
+                    res.SepY2 = h - (int)(16 * scale);
+                    res.ShowSeparator = true;
+
+                    res.NumAreaRect = new RectangleF(res.CardRect.Left, res.CardRect.Top, sepX - res.CardRect.Left, res.CardRect.Height);
+                    float numCenterX = res.NumAreaRect.X + res.NumAreaRect.Width / 2.0f;
+                    float numCenterY = res.NumAreaRect.Y + res.NumAreaRect.Height / 2.0f;
+
+                    res.NumDrawPoint = new PointF(
+                        numCenterX - (rawNumBounds.X + rawNumBounds.Width / 2.0f),
+                        numCenterY - (rawNumBounds.Y + rawNumBounds.Height / 2.0f));
+
+                    res.NumGlyphBounds = new RectangleF(
+                        res.NumDrawPoint.X + rawNumBounds.X,
+                        res.NumDrawPoint.Y + rawNumBounds.Y,
+                        rawNumBounds.Width,
+                        rawNumBounds.Height);
+                }
+                else
+                {
+                    res.ShowSeparator = false;
+                    res.NumAreaRect = RectangleF.Empty;
+                    res.NumDrawPoint = PointF.Empty;
+                    res.NumGlyphBounds = RectangleF.Empty;
+                }
+
+                // Content Area
+                if (showBigNumber)
+                {
+                    float contentLeft = sepX + 1;
+                    res.ContentAreaRect = new RectangleF(
+                        contentLeft,
+                        res.CardRect.Top,
+                        Math.Max(10f, res.CardRect.Right - contentLeft),
+                        res.CardRect.Height);
+                }
+                else
+                {
+                    res.ContentAreaRect = new RectangleF(
+                        res.CardRect.Left,
+                        res.CardRect.Top,
+                        res.CardRect.Width,
+                        res.CardRect.Height);
+                }
+
+                float contentCenterX = res.ContentAreaRect.X + res.ContentAreaRect.Width / 2.0f;
+                float contentCenterY = res.ContentAreaRect.Y + res.ContentAreaRect.Height / 2.0f;
+
+                bool hasSub = showSubtitle && !string.IsNullOrWhiteSpace(subText);
+                res.HasSubtitle = hasSub;
+
+                RectangleF rawTitleBounds = MeasureGlyphBounds(titleText, titleFont, sf);
+                RectangleF rawSubBounds = hasSub ? MeasureGlyphBounds(subText, subFont, sf) : RectangleF.Empty;
+
+                if (!hasSub)
+                {
+                    if (!string.IsNullOrEmpty(titleText))
+                    {
+                        res.TitleDrawPoint = new PointF(
+                            contentCenterX - (rawTitleBounds.X + rawTitleBounds.Width / 2.0f),
+                            contentCenterY - (rawTitleBounds.Y + rawTitleBounds.Height / 2.0f));
+
+                        res.TitleGlyphBounds = new RectangleF(
+                            res.TitleDrawPoint.X + rawTitleBounds.X,
+                            res.TitleDrawPoint.Y + rawTitleBounds.Y,
+                            rawTitleBounds.Width,
+                            rawTitleBounds.Height);
+                    }
+                    else
+                    {
+                        res.TitleDrawPoint = new PointF(contentCenterX, contentCenterY);
+                        res.TitleGlyphBounds = RectangleF.Empty;
+                    }
+
+                    res.SubDrawPoint = PointF.Empty;
+                    res.SubGlyphBounds = RectangleF.Empty;
+                }
+                else
+                {
+                    float lineGap = Math.Max(3f, (float)Math.Round(5f * scale));
+                    float totalBlockH = rawTitleBounds.Height + lineGap + rawSubBounds.Height;
+                    float blockTop = contentCenterY - totalBlockH / 2.0f;
+
+                    float titleTargetCenterY = blockTop + rawTitleBounds.Height / 2.0f;
+                    float subTargetCenterY = blockTop + rawTitleBounds.Height + lineGap + rawSubBounds.Height / 2.0f;
+
+                    res.TitleDrawPoint = new PointF(
+                        contentCenterX - (rawTitleBounds.X + rawTitleBounds.Width / 2.0f),
+                        titleTargetCenterY - (rawTitleBounds.Y + rawTitleBounds.Height / 2.0f));
+
+                    res.TitleGlyphBounds = new RectangleF(
+                        res.TitleDrawPoint.X + rawTitleBounds.X,
+                        res.TitleDrawPoint.Y + rawTitleBounds.Y,
+                        rawTitleBounds.Width,
+                        rawTitleBounds.Height);
+
+                    res.SubDrawPoint = new PointF(
+                        contentCenterX - (rawSubBounds.X + rawSubBounds.Width / 2.0f),
+                        subTargetCenterY - (rawSubBounds.Y + rawSubBounds.Height / 2.0f));
+
+                    res.SubGlyphBounds = new RectangleF(
+                        res.SubDrawPoint.X + rawSubBounds.X,
+                        res.SubDrawPoint.Y + rawSubBounds.Y,
+                        rawSubBounds.Width,
+                        rawSubBounds.Height);
+                }
+            }
+
+            return res;
+        }
+
+        internal static Size CalculateCardWindowSize(
+            float scale,
+            int currentDesktop,
+            string titleText,
+            string subText,
+            bool showBigNumber,
+            bool showSubtitle,
+            int titleFontSizeLogic)
+        {
+            int baseW = 240;
+            int baseH = 88;
+
+            string numText = currentDesktop.ToString();
+            int numFontSize = Math.Max(12, (int)(48 * scale));
+            int actualTitleFontSize = Math.Max(10, Math.Min(48, titleFontSizeLogic > 0 ? titleFontSizeLogic : 14));
+            int titleFontSize = Math.Max(8, (int)(actualTitleFontSize * scale));
+            int subFontSize = Math.Max(8, (int)(11 * scale));
+
+            using (StringFormat sf = StringFormat.GenericTypographic)
+            using (Font numFont = new Font("Segoe UI Variable Display", numFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (Font titleFont = new Font("Microsoft YaHei UI", titleFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (Font subFont = new Font("Microsoft YaHei UI", subFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
+            {
+                RectangleF rawTitleBounds = MeasureGlyphBounds(titleText, titleFont, sf);
+                bool hasSub = showSubtitle && !string.IsNullOrWhiteSpace(subText);
+                RectangleF rawSubBounds = hasSub ? MeasureGlyphBounds(subText, subFont, sf) : RectangleF.Empty;
+
+                float maxTextW = Math.Max(rawTitleBounds.Width, hasSub ? rawSubBounds.Width : 0);
+                float minW, minH;
+
+                if (showBigNumber)
+                {
+                    RectangleF rawNumBounds = MeasureGlyphBounds(numText, numFont, sf);
+                    float sepX = (int)((numText.Length > 1 ? 98 : 78) * scale);
+                    if (sepX < 4 + rawNumBounds.Width + 20 * scale)
+                    {
+                        sepX = (float)Math.Ceiling(4 + rawNumBounds.Width + 20 * scale);
+                    }
+                    minW = sepX + maxTextW + 36 * scale;
+                    float textH = hasSub ? (rawTitleBounds.Height + Math.Max(4f, 6f * scale) + rawSubBounds.Height) : rawTitleBounds.Height;
+                    minH = Math.Max(rawNumBounds.Height + 28 * scale, textH + 28 * scale);
+                }
+                else
+                {
+                    minW = maxTextW + 48 * scale;
+                    float textH = hasSub ? (rawTitleBounds.Height + Math.Max(4f, 6f * scale) + rawSubBounds.Height) : rawTitleBounds.Height;
+                    minH = textH + 28 * scale;
+                }
+
+                int w = (int)Math.Max(baseW * scale, Math.Ceiling(minW));
+                int h = (int)Math.Max(baseH * scale, Math.Ceiling(minH));
+                return new Size(w, h);
+            }
         }
 
         private void RenderCardStyle(Graphics g, int w, int h, float scale)
         {
-            Rectangle cardRect = new Rectangle(4, 4, w - 8, h - 8);
-            int radius = (int)(18 * scale);
-
             Color titleColor, subColor, numColor, cardBgColor, borderPenColor;
             GetThemeColors(out titleColor, out subColor, out numColor, out cardBgColor, out borderPenColor);
 
             if (_showBackgroundCard)
             {
-                using (GraphicsPath path = CreateRoundedRectanglePath(cardRect, radius))
+                CardBorderGeometry borderGeo = CalculateCardBorderGeometry(w, h, scale);
+                PixelOffsetMode oldPom = g.PixelOffsetMode;
+                try
                 {
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    using (GraphicsPath outerPath = CreateRoundedRectanglePath(borderGeo.OuterRect, borderGeo.OuterRadius))
                     using (SolidBrush bgBrush = new SolidBrush(cardBgColor))
                     {
-                        g.FillPath(bgBrush, path);
-                    }
-                    using (Pen borderPen = new Pen(borderPenColor, 1.2f))
-                    {
-                        g.DrawPath(borderPen, path);
+                        g.FillPath(bgBrush, outerPath);
                     }
                 }
+                finally
+                {
+                    g.PixelOffsetMode = oldPom;
+                }
+
+                RenderCardBorderRing(g, w, h, borderGeo, borderPenColor);
             }
 
             string numText = _currentDesktop.ToString();
@@ -1516,53 +2830,74 @@ namespace WindicatorPlus
                 subText = _isSnapped ? "🧲 已吸附" : "✋ 按住左键自由拖动";
             }
 
-            int numFontSize = (int)(48 * scale);
-            int titleFontSize = (int)(14 * scale);
-            int subFontSize = (int)(11 * scale);
+            CardLayoutResult layout = CalculateCardLayoutCore(
+                w,
+                h,
+                scale,
+                _currentDesktop,
+                titleText,
+                subText,
+                _showBigNumber,
+                _showSubtitle,
+                _titleFontSize);
 
+            int numFontSize = Math.Max(12, (int)(48 * scale));
+            int actualTitleFontSize = Math.Max(10, Math.Min(48, _titleFontSize > 0 ? _titleFontSize : 14));
+            int titleFontSize = Math.Max(8, (int)(actualTitleFontSize * scale));
+            int subFontSize = Math.Max(8, (int)(11 * scale));
+
+            using (StringFormat sf = StringFormat.GenericTypographic)
             using (Font numFont = new Font("Segoe UI Variable Display", numFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
             using (Font titleFont = new Font("Microsoft YaHei UI", titleFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
             using (Font subFont = new Font("Microsoft YaHei UI", subFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
             {
-                int textX = (int)(20 * scale);
-
-                if (_showBigNumber)
+                if (layout.ShowBigNumber)
                 {
                     using (SolidBrush shadow = new SolidBrush(Color.FromArgb(220, 0, 0, 0)))
                     {
-                        g.DrawString(numText, numFont, shadow, new PointF(textX + 2, (int)(14 * scale) + 1));
+                        g.DrawString(numText, numFont, shadow, new PointF(layout.NumDrawPoint.X + 2, layout.NumDrawPoint.Y + 1), sf);
                     }
                     using (SolidBrush white = new SolidBrush(numColor))
                     {
-                        g.DrawString(numText, numFont, white, new PointF(textX, (int)(14 * scale)));
+                        g.DrawString(numText, numFont, white, layout.NumDrawPoint, sf);
                     }
 
-                    int sepX = (int)((numText.Length > 1 ? 98 : 78) * scale);
-                    using (Pen sepPen = new Pen(Color.FromArgb(120, 255, 255, 255), 1.2f))
+                    if (layout.ShowSeparator)
                     {
-                        g.DrawLine(sepPen, sepX, (int)(16 * scale), sepX, h - (int)(16 * scale));
+                        Color sepColor = _useDesktopColor
+                            ? Color.FromArgb(120, borderPenColor.R, borderPenColor.G, borderPenColor.B)
+                            : Color.FromArgb(120, 255, 255, 255);
+                        using (Pen sepPen = new Pen(sepColor, 1.2f))
+                        {
+                            g.DrawLine(sepPen, layout.SepX, layout.SepY1, layout.SepX, layout.SepY2);
+                        }
                     }
-                    textX = sepX + (int)(14 * scale);
                 }
 
                 // High Contrast Title
-                using (SolidBrush titleShadow = new SolidBrush(Color.FromArgb(220, 0, 0, 0)))
-                using (SolidBrush titleBrush = new SolidBrush(titleColor))
+                if (!string.IsNullOrEmpty(titleText))
                 {
-                    g.DrawString(titleText, titleFont, titleShadow, new PointF(textX + 1, (int)(18 * scale) + 1));
-                    g.DrawString(titleText, titleFont, titleBrush, new PointF(textX, (int)(18 * scale)));
+                    using (SolidBrush titleShadow = new SolidBrush(Color.FromArgb(220, 0, 0, 0)))
+                    using (SolidBrush titleBrush = new SolidBrush(titleColor))
+                    {
+                        g.DrawString(titleText, titleFont, titleShadow, new PointF(layout.TitleDrawPoint.X + 1, layout.TitleDrawPoint.Y + 1), sf);
+                        g.DrawString(titleText, titleFont, titleBrush, layout.TitleDrawPoint, sf);
+                    }
                 }
 
                 // High Contrast Subtitle
-                Color displaySubColor = _isInteractive
-                    ? (_isSnapped ? Color.FromArgb(52, 211, 153) : Color.FromArgb(192, 132, 252))
-                    : subColor;
-
-                using (SolidBrush subShadow = new SolidBrush(Color.FromArgb(200, 0, 0, 0)))
-                using (SolidBrush subBrush = new SolidBrush(displaySubColor))
+                if (layout.HasSubtitle && !string.IsNullOrEmpty(subText))
                 {
-                    g.DrawString(subText, subFont, subShadow, new PointF(textX + 1, (int)(46 * scale) + 1));
-                    g.DrawString(subText, subFont, subBrush, new PointF(textX, (int)(46 * scale)));
+                    Color displaySubColor = _isInteractive
+                        ? (_isSnapped ? Color.FromArgb(52, 211, 153) : Color.FromArgb(192, 132, 252))
+                        : subColor;
+
+                    using (SolidBrush subShadow = new SolidBrush(Color.FromArgb(200, 0, 0, 0)))
+                    using (SolidBrush subBrush = new SolidBrush(displaySubColor))
+                    {
+                        g.DrawString(subText, subFont, subShadow, new PointF(layout.SubDrawPoint.X + 1, layout.SubDrawPoint.Y + 1), sf);
+                        g.DrawString(subText, subFont, subBrush, layout.SubDrawPoint, sf);
+                    }
                 }
             }
         }
@@ -1676,27 +3011,333 @@ namespace WindicatorPlus
                 subtitle = _isSnapped ? "🧲 已吸附" : "✋ 按住左键自由拖动";
             }
 
-            using (Font titleFont = new Font("Microsoft YaHei UI", (int)(19 * scale), FontStyle.Bold, GraphicsUnit.Pixel))
-            using (Font subFont = new Font("Microsoft YaHei UI", (int)(11 * scale), FontStyle.Bold, GraphicsUnit.Pixel))
+            int actualTitleFontSize = Math.Max(10, Math.Min(48, _titleFontSize > 0 ? _titleFontSize : 14));
+            int titleFontSize = Math.Max(8, (int)(actualTitleFontSize * scale));
+            int subFontSize = Math.Max(8, (int)(11 * scale));
+            bool hasSub = _showSubtitle && !string.IsNullOrWhiteSpace(subtitle);
+
+            using (StringFormat sf = StringFormat.GenericTypographic)
+            using (Font titleFont = new Font("Microsoft YaHei UI", titleFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (Font subFont = new Font("Microsoft YaHei UI", subFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
             {
-                using (SolidBrush shadow = new SolidBrush(Color.FromArgb(220, 0, 0, 0)))
+                float contentCenterX = cardRect.X + cardRect.Width / 2.0f;
+                float contentCenterY = cardRect.Y + cardRect.Height / 2.0f;
+
+                RectangleF titleBounds = MeasureGlyphBounds(title, titleFont, sf);
+                RectangleF subBounds = hasSub ? MeasureGlyphBounds(subtitle, subFont, sf) : RectangleF.Empty;
+
+                PointF titleDrawPoint;
+                PointF subDrawPoint = PointF.Empty;
+
+                if (!hasSub)
                 {
-                    g.DrawString(title, titleFont, shadow, new PointF((int)(20 * scale), (int)(14 * scale)));
+                    titleDrawPoint = new PointF(
+                        contentCenterX - (titleBounds.X + titleBounds.Width / 2.0f),
+                        contentCenterY - (titleBounds.Y + titleBounds.Height / 2.0f));
                 }
-                using (SolidBrush textBrush = new SolidBrush(titleColor))
+                else
                 {
-                    g.DrawString(title, titleFont, textBrush, new PointF((int)(18 * scale), (int)(12 * scale)));
+                    float gap = Math.Max(3f, (float)Math.Round(5f * scale));
+                    float totalH = titleBounds.Height + gap + subBounds.Height;
+                    float blockTop = contentCenterY - totalH / 2.0f;
+
+                    float titleTargetY = blockTop + titleBounds.Height / 2.0f;
+                    float subTargetY = blockTop + titleBounds.Height + gap + subBounds.Height / 2.0f;
+
+                    titleDrawPoint = new PointF(
+                        contentCenterX - (titleBounds.X + titleBounds.Width / 2.0f),
+                        titleTargetY - (titleBounds.Y + titleBounds.Height / 2.0f));
+
+                    subDrawPoint = new PointF(
+                        contentCenterX - (subBounds.X + subBounds.Width / 2.0f),
+                        subTargetY - (subBounds.Y + subBounds.Height / 2.0f));
                 }
 
-                Color displaySubColor = _isInteractive
-                    ? (_isSnapped ? Color.FromArgb(52, 211, 153) : Color.FromArgb(192, 132, 252))
-                    : subColor;
-
-                using (SolidBrush subBrush = new SolidBrush(displaySubColor))
+                if (!string.IsNullOrEmpty(title))
                 {
-                    g.DrawString(subtitle, subFont, subBrush, new PointF((int)(19 * scale), (int)(46 * scale)));
+                    using (SolidBrush shadow = new SolidBrush(Color.FromArgb(220, 0, 0, 0)))
+                    using (SolidBrush textBrush = new SolidBrush(titleColor))
+                    {
+                        g.DrawString(title, titleFont, shadow, new PointF(titleDrawPoint.X + 1, titleDrawPoint.Y + 1), sf);
+                        g.DrawString(title, titleFont, textBrush, titleDrawPoint, sf);
+                    }
+                }
+
+                if (hasSub && !string.IsNullOrEmpty(subtitle))
+                {
+                    Color displaySubColor = _isInteractive
+                        ? (_isSnapped ? Color.FromArgb(52, 211, 153) : Color.FromArgb(192, 132, 252))
+                        : subColor;
+
+                    using (SolidBrush subBrush = new SolidBrush(displaySubColor))
+                    {
+                        g.DrawString(subtitle, subFont, subBrush, subDrawPoint, sf);
+                    }
                 }
             }
+        }
+
+        internal struct CardBorderGeometry
+        {
+            public RectangleF OuterRect;
+            public RectangleF InnerRect;
+            public float OuterRadius;
+            public float InnerRadius;
+            public float Thickness;
+            public PointF TopLeftOuterCenter;
+            public PointF TopLeftInnerCenter;
+            public PointF TopRightOuterCenter;
+            public PointF TopRightInnerCenter;
+            public PointF BottomRightOuterCenter;
+            public PointF BottomRightInnerCenter;
+            public PointF BottomLeftOuterCenter;
+            public PointF BottomLeftInnerCenter;
+        }
+
+        internal static CardBorderGeometry CalculateCardBorderGeometry(int w, int h, float scale)
+        {
+            float thickness = 2.4f * scale;
+            RectangleF outerRect = new RectangleF(4f, 4f, (float)(w - 8), (float)(h - 8));
+            float outerRadius = 18f * scale;
+
+            float innerX = outerRect.X + thickness;
+            float innerY = outerRect.Y + thickness;
+            float innerW = Math.Max(0f, outerRect.Width - 2f * thickness);
+            float innerH = Math.Max(0f, outerRect.Height - 2f * thickness);
+            float innerRadius = Math.Max(0f, outerRadius - thickness);
+            RectangleF innerRect = new RectangleF(innerX, innerY, innerW, innerH);
+
+            CardBorderGeometry geo = new CardBorderGeometry();
+            geo.OuterRect = outerRect;
+            geo.InnerRect = innerRect;
+            geo.OuterRadius = outerRadius;
+            geo.InnerRadius = innerRadius;
+            geo.Thickness = thickness;
+
+            geo.TopLeftOuterCenter = new PointF(outerRect.X + outerRadius, outerRect.Y + outerRadius);
+            geo.TopLeftInnerCenter = new PointF(innerRect.X + innerRadius, innerRect.Y + innerRadius);
+
+            geo.TopRightOuterCenter = new PointF(outerRect.Right - outerRadius, outerRect.Y + outerRadius);
+            geo.TopRightInnerCenter = new PointF(innerRect.Right - innerRadius, innerRect.Y + innerRadius);
+
+            geo.BottomRightOuterCenter = new PointF(outerRect.Right - outerRadius, outerRect.Bottom - outerRadius);
+            geo.BottomRightInnerCenter = new PointF(innerRect.Right - innerRadius, innerRect.Bottom - innerRadius);
+
+            geo.BottomLeftOuterCenter = new PointF(outerRect.X + outerRadius, outerRect.Bottom - outerRadius);
+            geo.BottomLeftInnerCenter = new PointF(innerRect.X + innerRadius, innerRect.Bottom - innerRadius);
+
+            return geo;
+        }
+
+        internal static void AddRoundedRectangleToPath(GraphicsPath path, RectangleF rect, float radius)
+        {
+            if (rect.Width <= 0 || rect.Height <= 0) return;
+
+            float maxRadius = Math.Min(rect.Width / 2f, rect.Height / 2f);
+            float r = Math.Min(radius, maxRadius);
+
+            if (r <= 0.05f)
+            {
+                path.AddRectangle(rect);
+                path.CloseFigure();
+                return;
+            }
+
+            float d = r * 2f;
+            path.AddArc(rect.X, rect.Y, d, d, 180f, 90f);
+            path.AddArc(rect.Right - d, rect.Y, d, d, 270f, 90f);
+            path.AddArc(rect.Right - d, rect.Bottom - d, d, d, 0f, 90f);
+            path.AddArc(rect.X, rect.Bottom - d, d, d, 90f, 90f);
+            path.CloseFigure();
+        }
+
+        internal static GraphicsPath CreateRoundedRectanglePath(RectangleF rect, float radius)
+        {
+            GraphicsPath path = new GraphicsPath();
+            AddRoundedRectangleToPath(path, rect, radius);
+            return path;
+        }
+
+        internal static GraphicsPath CreateRoundedRectangleRingPath(RectangleF outerRect, float outerRadius, float thickness)
+        {
+            GraphicsPath path = new GraphicsPath();
+            path.FillMode = FillMode.Alternate;
+            AddRoundedRectangleToPath(path, outerRect, outerRadius);
+
+            float innerX = outerRect.X + thickness;
+            float innerY = outerRect.Y + thickness;
+            float innerW = Math.Max(0f, outerRect.Width - 2f * thickness);
+            float innerH = Math.Max(0f, outerRect.Height - 2f * thickness);
+            float innerRadius = Math.Max(0f, outerRadius - thickness);
+
+            RectangleF innerRect = new RectangleF(innerX, innerY, innerW, innerH);
+            AddRoundedRectangleToPath(path, innerRect, innerRadius);
+
+            return path;
+        }
+
+        internal static void RenderCardBorderRing(Graphics g, int w, int h, CardBorderGeometry borderGeo, Color borderPenColor)
+        {
+            using (Bitmap borderBmp = CreateSymmetricBorderBitmap(w, h, borderGeo.OuterRect, borderGeo.OuterRadius, borderGeo.Thickness, borderPenColor))
+            {
+                InterpolationMode oldIm = g.InterpolationMode;
+                PixelOffsetMode oldPom = g.PixelOffsetMode;
+                CompositingMode oldCm = g.CompositingMode;
+                CompositingQuality oldCq = g.CompositingQuality;
+                try
+                {
+                    g.InterpolationMode = InterpolationMode.NearestNeighbor;
+                    g.PixelOffsetMode = PixelOffsetMode.None;
+                    g.CompositingMode = CompositingMode.SourceOver;
+                    g.CompositingQuality = CompositingQuality.HighQuality;
+                    borderBmp.SetResolution(g.DpiX, g.DpiY);
+                    g.DrawImage(borderBmp, new Rectangle(0, 0, w, h), 0, 0, w, h, GraphicsUnit.Pixel);
+                }
+                finally
+                {
+                    g.InterpolationMode = oldIm;
+                    g.PixelOffsetMode = oldPom;
+                    g.CompositingMode = oldCm;
+                    g.CompositingQuality = oldCq;
+                }
+            }
+        }
+
+        internal static Bitmap CreateSymmetricBorderBitmap(int w, int h, RectangleF outerRect, float outerRadius, float thickness, Color borderPenColor)
+        {
+            Bitmap bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+            BitmapData data = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+            int stride = data.Stride;
+            byte[] buffer = new byte[stride * h];
+
+            float cx = outerRect.X + outerRect.Width / 2f;
+            float cy = outerRect.Y + outerRect.Height / 2f;
+            float hw = outerRect.Width / 2f;
+            float hh = outerRect.Height / 2f;
+            float hw_in = hw - thickness;
+            float hh_in = hh - thickness;
+            float innerRadius = Math.Max(0f, outerRadius - thickness);
+            float qx = hw - outerRadius;
+            float qy = hh - outerRadius;
+            float r_out_sq = outerRadius * outerRadius;
+            float r_in_sq = innerRadius * innerRadius;
+
+            int N = 8;
+            float subStep = 1.0f / N;
+            float halfSub = 0.5f / N;
+            float invTotal = 1.0f / (N * N);
+
+            byte baseA = borderPenColor.A;
+            byte baseR = borderPenColor.R;
+            byte baseG = borderPenColor.G;
+            byte baseB = borderPenColor.B;
+
+            for (int y = 0; y < h; y++)
+            {
+                int rowOffset = y * stride;
+                for (int x = 0; x < w; x++)
+                {
+                    float minDx = (x <= cx && cx <= x + 1f) ? 0f : Math.Min(Math.Abs(x - cx), Math.Abs(x + 1f - cx));
+                    float maxDx = Math.Max(Math.Abs(x - cx), Math.Abs(x + 1f - cx));
+                    float minDy = (y <= cy && cy <= y + 1f) ? 0f : Math.Min(Math.Abs(y - cy), Math.Abs(y + 1f - cy));
+                    float maxDy = Math.Max(Math.Abs(y - cy), Math.Abs(y + 1f - cy));
+
+                    if (minDx > hw || minDy > hh) continue;
+                    if (minDx > qx && minDy > qy)
+                    {
+                        float ex = minDx - qx;
+                        float ey = minDy - qy;
+                        if (ex * ex + ey * ey > r_out_sq) continue;
+                    }
+
+                    if (maxDx <= hw_in && maxDy <= hh_in)
+                    {
+                        if (maxDx <= qx || maxDy <= qy) continue;
+                        float ex = maxDx - qx;
+                        float ey = maxDy - qy;
+                        if (ex * ex + ey * ey <= r_in_sq) continue;
+                    }
+
+                    bool fullyInOuter = (maxDx <= hw && maxDy <= hh);
+                    if (fullyInOuter && maxDx > qx && maxDy > qy)
+                    {
+                        float ex = maxDx - qx;
+                        float ey = maxDy - qy;
+                        fullyInOuter = (ex * ex + ey * ey <= r_out_sq);
+                    }
+
+                    bool fullyOutInner = (minDx > hw_in || minDy > hh_in);
+                    if (!fullyOutInner && minDx > qx && minDy > qy)
+                    {
+                        float ex = minDx - qx;
+                        float ey = minDy - qy;
+                        fullyOutInner = (ex * ex + ey * ey > r_in_sq);
+                    }
+
+                    int pxOffset = rowOffset + x * 4;
+                    if (fullyInOuter && fullyOutInner)
+                    {
+                        buffer[pxOffset] = baseB;
+                        buffer[pxOffset + 1] = baseG;
+                        buffer[pxOffset + 2] = baseR;
+                        buffer[pxOffset + 3] = baseA;
+                        continue;
+                    }
+
+                    int hits = 0;
+                    for (int sy = 0; sy < N; sy++)
+                    {
+                        float py = y + sy * subStep + halfSub;
+                        float dy = Math.Abs(py - cy);
+                        if (dy > hh) continue;
+
+                        for (int sx = 0; sx < N; sx++)
+                        {
+                            float px = x + sx * subStep + halfSub;
+                            float dx = Math.Abs(px - cx);
+                            if (dx > hw) continue;
+
+                            bool inOut;
+                            if (dx <= qx || dy <= qy) inOut = true;
+                            else
+                            {
+                                float ex = dx - qx;
+                                float ey = dy - qy;
+                                inOut = (ex * ex + ey * ey <= r_out_sq);
+                            }
+                            if (!inOut) continue;
+
+                            bool inIn;
+                            if (dx > hw_in || dy > hh_in) inIn = false;
+                            else if (dx <= qx || dy <= qy) inIn = true;
+                            else
+                            {
+                                float ex = dx - qx;
+                                float ey = dy - qy;
+                                inIn = (ex * ex + ey * ey <= r_in_sq);
+                            }
+                            if (!inIn) hits++;
+                        }
+                    }
+
+                    if (hits > 0)
+                    {
+                        float coverage = hits * invTotal;
+                        byte alpha = (byte)Math.Round(baseA * coverage);
+                        if (alpha > 0)
+                        {
+                            buffer[pxOffset] = baseB;
+                            buffer[pxOffset + 1] = baseG;
+                            buffer[pxOffset + 2] = baseR;
+                            buffer[pxOffset + 3] = alpha;
+                        }
+                    }
+                }
+            }
+
+            Marshal.Copy(buffer, 0, data.Scan0, buffer.Length);
+            bmp.UnlockBits(data);
+            return bmp;
         }
 
         private GraphicsPath CreateRoundedRectanglePath(Rectangle rect, int radius)
@@ -1711,10 +3352,19 @@ namespace WindicatorPlus
             return path;
         }
 
+        protected override void OnHandleDestroyed(EventArgs e)
+        {
+            _lastTaskbarRenderKey = null;
+            InvalidateDockedAnchor();
+            base.OnHandleDestroyed(e);
+        }
+
         protected override void Dispose(bool disposing)
         {
             if (disposing)
             {
+                _lastTaskbarRenderKey = null;
+                InvalidateDockedAnchor();
                 if (_taskbarSpaceProvider != null)
                 {
                     _taskbarSpaceProvider.SpaceChanged -= OnTaskbarSpaceChanged;
@@ -1726,6 +3376,11 @@ namespace WindicatorPlus
                 {
                     _monitorThread.Join(200);
                     _monitorThread = null;
+                }
+                if (LastRenderedBitmapForTest != null)
+                {
+                    try { LastRenderedBitmapForTest.Dispose(); } catch { }
+                    LastRenderedBitmapForTest = null;
                 }
                 SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
             }

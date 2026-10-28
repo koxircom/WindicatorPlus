@@ -369,6 +369,8 @@ namespace WindicatorPlus.Tests
                 Assert(contentPanel.AutoScroll, "Content panel must have AutoScroll enabled");
 
                 InvokeSwitchTab(form, "Watermark");
+                // Each page owns its scroller; do not scroll the previous General page.
+                contentPanel = GetRightContentPanel(form);
                 Control watermarkView = GetViewField(form, "_viewWatermark");
                 Assert(watermarkView != null, "Watermark view must exist");
 

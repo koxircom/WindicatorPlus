@@ -15,6 +15,13 @@ namespace WindicatorPlus
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool SetForegroundWindow(IntPtr hWnd);
 
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        private const uint EVENT_OBJECT_REORDER = 0x8004;
+        private const int OBJID_WINDOW = 0;
+        private const int OBJID_CLIENT = -4;
+
         private NotifyIcon _notifyIcon;
         private ContextMenuStrip _contextMenu;
         private AppConfig _config;
@@ -51,8 +58,19 @@ namespace WindicatorPlus
 
         private MenuHostForm _menuHostForm = null;
         private SettingsForm _settingsForm = null;
-        private TaskbarTintOverlay _tintOverlay = null;
         private Timer _zOrderTimer = null;
+        private NativeMethods.WinEventDelegate _foregroundWinEventProc = null;
+        private IntPtr _hForegroundWinEventHook = IntPtr.Zero;
+        private int _isForegroundReconcilePending = 0;
+        private NativeMethods.WinEventDelegate _shellReorderWinEventProc = null;
+        private IntPtr _hShellReorderWinEventHook = IntPtr.Zero;
+        private int _isShellReorderReconcilePending = 0;
+        private bool _isReconciling = false;
+        private volatile bool _disposed = false;
+
+        internal IntPtr ShellReorderWinEventHook { get { return _hShellReorderWinEventHook; } }
+        internal IntPtr ForegroundWinEventHook { get { return _hForegroundWinEventHook; } }
+        internal Func<IntPtr> ShellWindowResolver { get; set; }
 
         // Clean & Modern Menu items
         private ToolStripMenuItem _menuOpenSettings;
@@ -66,12 +84,11 @@ namespace WindicatorPlus
 
         public event Action ExitRequested;
 
-        public TrayIconManager(AppConfig config, WatermarkWindow watermark, DesktopWatcher watcher, TaskbarTintOverlay tintOverlay = null)
+        public TrayIconManager(AppConfig config, WatermarkWindow watermark, DesktopWatcher watcher)
         {
             _config = config;
             _watermark = watermark;
             _watcher = watcher;
-            _tintOverlay = tintOverlay;
 
             InitializeContextMenu();
 
@@ -120,6 +137,158 @@ namespace WindicatorPlus
                 ReconcileTaskbarOverlayOrder();
             };
             _zOrderTimer.Start();
+
+            // 挂载 WinEvent 监听前台切换 (EVENT_SYSTEM_FOREGROUND)
+            _foregroundWinEventProc = new NativeMethods.WinEventDelegate(OnForegroundChanged);
+            _hForegroundWinEventHook = NativeMethods.SetWinEventHook(
+                NativeMethods.EVENT_SYSTEM_FOREGROUND,
+                NativeMethods.EVENT_SYSTEM_FOREGROUND,
+                IntPtr.Zero,
+                _foregroundWinEventProc,
+                0,
+                0,
+                NativeMethods.WINEVENT_OUTOFCONTEXT);
+
+            // 挂载 WinEvent 监听 Shell 层级变动 (EVENT_OBJECT_REORDER 0x8004)
+            _shellReorderWinEventProc = new NativeMethods.WinEventDelegate(OnShellReorderedCallback);
+            _hShellReorderWinEventHook = NativeMethods.SetWinEventHook(
+                EVENT_OBJECT_REORDER,
+                EVENT_OBJECT_REORDER,
+                IntPtr.Zero,
+                _shellReorderWinEventProc,
+                0,
+                0,
+                NativeMethods.WINEVENT_OUTOFCONTEXT);
+        }
+
+        private void OnForegroundChanged(IntPtr hWinEventHook, uint eventType, IntPtr hWnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
+        {
+            if (_disposed) return;
+            // 契约：不操作前台/不抓任何文本；回调合并BeginInvoke至已有_watermark（始终有Handle）UI线程触发Reconcile，无需主动创建/Show menuhost
+            if (System.Threading.Interlocked.CompareExchange(ref _isForegroundReconcilePending, 1, 0) == 0)
+            {
+                if (_watermark != null && !_watermark.IsDisposed && _watermark.IsHandleCreated)
+                {
+                    try
+                    {
+                        _watermark.BeginInvoke(new Action(() =>
+                        {
+                            _isForegroundReconcilePending = 0;
+                            if (_disposed) return;
+                            ReconcileTaskbarOverlayOrder();
+                        }));
+                    }
+                    catch
+                    {
+                        _isForegroundReconcilePending = 0;
+                    }
+                }
+                else
+                {
+                    _isForegroundReconcilePending = 0;
+                }
+            }
+        }
+
+        private void OnShellReorderedCallback(IntPtr hWinEventHook, uint eventType, IntPtr hWnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
+        {
+            OnShellReordered(hWinEventHook, eventType, hWnd, idObject, idChild, dwEventThread, dwmsEventTime, IntPtr.Zero);
+        }
+
+        internal void OnShellReordered(IntPtr hWinEventHook, uint eventType, IntPtr hWnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime, IntPtr explicitShell = default(IntPtr))
+        {
+            if (_disposed || _isReconciling) return;
+
+            // 1. 过滤事件类型：必须是 EVENT_OBJECT_REORDER (0x8004)
+            if (eventType != EVENT_OBJECT_REORDER) return;
+
+            // 2. 过滤 idChild：必须为 0
+            if (idChild != 0) return;
+
+            // 3. 过滤 idObject：必须为 OBJID_WINDOW (0) 或 OBJID_CLIENT (-4)
+            if (idObject != OBJID_WINDOW && idObject != OBJID_CLIENT) return;
+
+            // 4. 解析目标 Shell 窗口
+            IntPtr targetShell = explicitShell != IntPtr.Zero ? explicitShell : GetShellWindow();
+            if (targetShell == IntPtr.Zero || !NativeMethods.IsWindow(targetShell)) return;
+
+            // 5. 过滤 hWnd：必须匹配当前目标 Shell
+            if (hWnd != targetShell) return;
+
+            // 6. 防回环：不响应本 app 自身窗口与自身进程
+            if (IsOurAppWindow(hWnd)) return;
+
+            // 7. 合并调度：复用合并 BeginInvoke 至 _watermark UI 线程触发 Reconcile
+            if (System.Threading.Interlocked.CompareExchange(ref _isShellReorderReconcilePending, 1, 0) == 0)
+            {
+                if (_watermark != null && !_watermark.IsDisposed && _watermark.IsHandleCreated)
+                {
+                    try
+                    {
+                        _watermark.BeginInvoke(new Action(() =>
+                        {
+                            _isShellReorderReconcilePending = 0;
+                            if (_disposed || _isReconciling) return;
+                            ReconcileTaskbarOverlayOrder(explicitShell);
+                        }));
+                    }
+                    catch
+                    {
+                        _isShellReorderReconcilePending = 0;
+                    }
+                }
+                else
+                {
+                    _isShellReorderReconcilePending = 0;
+                }
+            }
+        }
+
+        internal IntPtr GetShellWindow()
+        {
+            if (ShellWindowResolver != null)
+            {
+                try
+                {
+                    IntPtr res = ShellWindowResolver();
+                    if (res != IntPtr.Zero) return res;
+                }
+                catch { }
+            }
+            return NativeMethods.FindWindow("Shell_TrayWnd", null);
+        }
+
+        private bool IsOurAppOverlayWindow(IntPtr hWnd)
+        {
+            if (hWnd == IntPtr.Zero) return false;
+            try
+            {
+                if (_watermark != null && _watermark.IsHandleCreated && _watermark.Handle == hWnd) return true;
+                if (_menuHostForm != null && _menuHostForm.IsHandleCreated && _menuHostForm.Handle == hWnd) return true;
+                if (_contextMenu != null && _contextMenu.IsHandleCreated && _contextMenu.Handle == hWnd) return true;
+                if (_settingsForm != null && _settingsForm.IsHandleCreated && _settingsForm.Handle == hWnd) return true;
+            }
+            catch { }
+            return false;
+        }
+
+        private bool IsOurAppWindow(IntPtr hWnd)
+        {
+            if (hWnd == IntPtr.Zero) return false;
+            if (IsOurAppOverlayWindow(hWnd)) return true;
+
+            // 当使用默认真实 Shell 时，Shell 属于 explorer.exe，PID 必不为当前进程
+            if (ShellWindowResolver == null)
+            {
+                try
+                {
+                    uint pid;
+                    GetWindowThreadProcessId(hWnd, out pid);
+                    if (pid == (uint)Process.GetCurrentProcess().Id) return true;
+                }
+                catch { }
+            }
+            return false;
         }
 
         private void ShowContextMenuAboveTaskbar()
@@ -214,13 +383,15 @@ namespace WindicatorPlus
 
             _contextMenu.Opened += (s, e) =>
             {
+                if (_disposed) return;
                 ReconcileTaskbarOverlayOrder();
-                if (_menuHostForm != null && !_menuHostForm.IsDisposed && _menuHostForm.IsHandleCreated)
+                if (_watermark != null && !_watermark.IsDisposed && _watermark.IsHandleCreated)
                 {
                     try
                     {
-                        _menuHostForm.BeginInvoke(new Action(() =>
+                        _watermark.BeginInvoke(new Action(() =>
                         {
+                            if (_disposed) return;
                             ReconcileTaskbarOverlayOrder();
                         }));
                     }
@@ -244,13 +415,15 @@ namespace WindicatorPlus
                         try { _menuHostForm.Hide(); } catch { }
                     }
                 }
+                if (_disposed) return;
                 ReconcileTaskbarOverlayOrder();
-                if (_menuHostForm != null && !_menuHostForm.IsDisposed && _menuHostForm.IsHandleCreated)
+                if (_watermark != null && !_watermark.IsDisposed && _watermark.IsHandleCreated)
                 {
                     try
                     {
-                        _menuHostForm.BeginInvoke(new Action(() =>
+                        _watermark.BeginInvoke(new Action(() =>
                         {
+                            if (_disposed) return;
                             ReconcileTaskbarOverlayOrder();
                         }));
                     }
@@ -289,13 +462,13 @@ namespace WindicatorPlus
             };
             _contextMenu.Items.Add(_menuWatermarkToggle);
 
-            _menuTaskbarTintToggle = new ToolStripMenuItem("🎨 任务栏专属氛围色", null, (s, e) =>
+            _menuTaskbarTintToggle = new ToolStripMenuItem("🎨 水印使用桌面专属色", null, (s, e) =>
             {
                 _config.TaskbarTintEnabled = !_config.TaskbarTintEnabled;
                 _menuTaskbarTintToggle.Checked = _config.TaskbarTintEnabled;
-                if (_tintOverlay != null)
+                if (_watermark != null)
                 {
-                    _tintOverlay.ApplyConfig(_config, _watcher != null ? _watcher.CurrentDesktop : 1);
+                    _watermark.ApplyConfig(_config);
                 }
                 ConfigManager.Save(_config);
             })
@@ -527,7 +700,7 @@ namespace WindicatorPlus
         {
             if (_settingsForm == null || _settingsForm.IsDisposed)
             {
-                _settingsForm = new SettingsForm(_config, _watermark, this, _watcher, _tintOverlay);
+                _settingsForm = new SettingsForm(_config, _watermark, this, _watcher);
                 _settingsForm.CreateControl();
                 IntPtr h = _settingsForm.Handle;
             }
@@ -537,7 +710,7 @@ namespace WindicatorPlus
         {
             if (_settingsForm == null || _settingsForm.IsDisposed)
             {
-                _settingsForm = new SettingsForm(_config, _watermark, this, _watcher, _tintOverlay);
+                _settingsForm = new SettingsForm(_config, _watermark, this, _watcher);
             }
             if (_settingsForm.WindowState == FormWindowState.Minimized)
             {
@@ -550,6 +723,23 @@ namespace WindicatorPlus
 
         public void Dispose()
         {
+            if (_disposed) return;
+            _disposed = true;
+
+            if (_hForegroundWinEventHook != IntPtr.Zero)
+            {
+                NativeMethods.UnhookWinEvent(_hForegroundWinEventHook);
+                _hForegroundWinEventHook = IntPtr.Zero;
+            }
+            _foregroundWinEventProc = null;
+
+            if (_hShellReorderWinEventHook != IntPtr.Zero)
+            {
+                NativeMethods.UnhookWinEvent(_hShellReorderWinEventHook);
+                _hShellReorderWinEventHook = IntPtr.Zero;
+            }
+            _shellReorderWinEventProc = null;
+
             if (_zOrderTimer != null)
             {
                 _zOrderTimer.Stop();
@@ -645,25 +835,14 @@ namespace WindicatorPlus
 
         internal void ReconcileTaskbarOverlayOrder(IntPtr shellOverride)
         {
+            if (_disposed || _isReconciling) return;
+            _isReconciling = true;
             try
             {
-                IntPtr hShell = shellOverride != IntPtr.Zero ? shellOverride : NativeMethods.FindWindow("Shell_TrayWnd", null);
+                IntPtr hShell = shellOverride != IntPtr.Zero ? shellOverride : GetShellWindow();
                 if (hShell == IntPtr.Zero || !NativeMethods.IsWindow(hShell) || !NativeMethods.IsWindowVisible(hShell))
                 {
                     return;
-                }
-
-                IntPtr hTint = IntPtr.Zero;
-                if (_tintOverlay != null && !_tintOverlay.IsDisposed && _tintOverlay.Visible && _tintOverlay.IsHandleCreated)
-                {
-                    NativeMethods.RECT rc;
-                    if (NativeMethods.GetWindowRect(_tintOverlay.Handle, out rc))
-                    {
-                        if ((rc.Right - rc.Left) > 1 && (rc.Bottom - rc.Top) > 1)
-                        {
-                            hTint = _tintOverlay.Handle;
-                        }
-                    }
                 }
 
                 IntPtr hWater = IntPtr.Zero;
@@ -693,16 +872,15 @@ namespace WindicatorPlus
                 }
 
                 // If none of our layers are active/visible, nothing to reconcile
-                if (hTint == IntPtr.Zero && hWater == IntPtr.Zero && hMenu == IntPtr.Zero)
+                if (hWater == IntPtr.Zero && hMenu == IntPtr.Zero)
                 {
                     return;
                 }
 
-                // 预期从顶到底：[Menu] > [Watermark] > [Tint] > [Shell]
+                // 预期从顶到底：[Menu] > [Watermark] > [Shell]
                 List<IntPtr> activeChain = new List<IntPtr>();
                 if (hMenu != IntPtr.Zero) activeChain.Add(hMenu);
                 if (hWater != IntPtr.Zero) activeChain.Add(hWater);
-                if (hTint != IntPtr.Zero) activeChain.Add(hTint);
                 activeChain.Add(hShell);
 
                 // 检查所有相邻对：先遍历全部相邻对确保没有 Unknown，绝不能因首个 wrong 立即 break 漏掉后面的 Unknown
@@ -714,7 +892,7 @@ namespace WindicatorPlus
                     ZOrderRelation rel = GetZOrderRelation(higher, lower, 512);
                     if (rel == ZOrderRelation.Unknown)
                     {
-                        // 句柄不在同一链或越界，只要存在任一 unknown，返回不盲目 raise
+                        // 句柄不在同一 Z 序链或检索步数超限（Unknown），返回不盲目调整
                         return;
                     }
                     if (rel != ZOrderRelation.Above)
@@ -723,31 +901,109 @@ namespace WindicatorPlus
                     }
                 }
 
-                // 已满足 menu > watermark > tint > shell 时绝不 SetWindowPos
+                // 已满足 menu > watermark > shell 时绝不 SetWindowPos (no-op)
                 if (orderCorrect)
                 {
                     return;
                 }
 
-                // 失序时仅受影响层按 tint、watermark、可见 menu 顺序使用 HWND_TOPMOST+NOMOVE|NOSIZE|NOACTIVATE（不要 SHOWWINDOW），保证 menu 最高
+                // 失序时使用 BeginDeferWindowPos/DeferWindowPos/EndDeferWindowPos 批处理原子调整：
+                // 避免单独多次 SetWindowPos 引起 menu 瞬间被 watermark 遮挡
+                // 层级从顶到底：Menu > Watermark > Shell
+                // 1. Watermark: 提升到 TOPMOST（位于 Shell 之上）
+                // 2. Menu: 提升到 TOPMOST（位于 Watermark 之上，保持 Menu 在栈顶最前）
+                // 标志统一：NOMOVE | NOSIZE | NOACTIVATE（无 SHOWWINDOW）
                 uint flags = NativeMethods.SWP_NOMOVE | NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOACTIVATE;
 
-                if (hTint != IntPtr.Zero)
-                {
-                    NativeMethods.SetWindowPos(hTint, NativeMethods.HWND_TOPMOST, 0, 0, 0, 0, flags);
-                }
+                bool needWaterRaise = false;
                 if (hWater != IntPtr.Zero)
                 {
-                    NativeMethods.SetWindowPos(hWater, NativeMethods.HWND_TOPMOST, 0, 0, 0, 0, flags);
+                    if (GetZOrderRelation(hWater, hShell, 512) != ZOrderRelation.Above)
+                    {
+                        // Shell 盖过了 Watermark，Watermark 必须提升保持在 Shell 之上
+                        needWaterRaise = true;
+                    }
                 }
+
+                bool needMenuRaise = false;
                 if (hMenu != IntPtr.Zero)
                 {
-                    NativeMethods.SetWindowPos(hMenu, NativeMethods.HWND_TOPMOST, 0, 0, 0, 0, flags);
+                    if (needWaterRaise)
+                    {
+                        // 下层窗口被提升，Menu 必须一同提升保持在栈顶最前
+                        needMenuRaise = true;
+                    }
+                    else if (hWater != IntPtr.Zero && GetZOrderRelation(hMenu, hWater, 512) != ZOrderRelation.Above)
+                    {
+                        needMenuRaise = true;
+                    }
+                    else if (GetZOrderRelation(hMenu, hShell, 512) != ZOrderRelation.Above)
+                    {
+                        needMenuRaise = true;
+                    }
                 }
+
+                // 联动确保：Watermark 抬高时，有 menu 一起抬高
+                if (needWaterRaise)
+                {
+                    if (hMenu != IntPtr.Zero) needMenuRaise = true;
+                }
+
+                // 兜底保障：若 activeChain 存在任何失序但未命中单项标记，全部活跃层一并提升重新校准
+                if (!orderCorrect && !needWaterRaise && !needMenuRaise)
+                {
+                    if (hWater != IntPtr.Zero) needWaterRaise = true;
+                    if (hMenu != IntPtr.Zero) needMenuRaise = true;
+                }
+
+                int moveCount = 0;
+                if (needWaterRaise) moveCount++;
+                if (needMenuRaise) moveCount++;
+
+                if (moveCount == 0)
+                {
+                    return;
+                }
+
+                if (RuntimeTrace.IsEnabled)
+                {
+                    string waterShellRel = hWater != IntPtr.Zero ? GetZOrderRelation(hWater, hShell, 512).ToString() : "None";
+                    string menuWaterRel = (hMenu != IntPtr.Zero && hWater != IntPtr.Zero) ? GetZOrderRelation(hMenu, hWater, 512).ToString() : "None";
+                    string menuShellRel = hMenu != IntPtr.Zero ? GetZOrderRelation(hMenu, hShell, 512).ToString() : "None";
+
+                    RuntimeTrace.LogCoordinatorAdjust(
+                        hShell, hWater, IntPtr.Zero, hMenu,
+                        "None", waterShellRel, menuWaterRel, menuShellRel,
+                        false, needWaterRaise, needMenuRaise);
+                }
+
+                IntPtr hdwp = NativeMethods.BeginDeferWindowPos(moveCount);
+                if (hdwp == IntPtr.Zero)
+                {
+                    return;
+                }
+
+                if (needWaterRaise)
+                {
+                    hdwp = NativeMethods.DeferWindowPos(hdwp, hWater, NativeMethods.HWND_TOPMOST, 0, 0, 0, 0, flags);
+                    if (hdwp == IntPtr.Zero) return;
+                }
+
+                if (needMenuRaise)
+                {
+                    hdwp = NativeMethods.DeferWindowPos(hdwp, hMenu, NativeMethods.HWND_TOPMOST, 0, 0, 0, 0, flags);
+                    if (hdwp == IntPtr.Zero) return;
+                }
+
+                NativeMethods.EndDeferWindowPos(hdwp);
             }
             catch (Exception ex)
             {
                 Debug.WriteLine("[ReconcileTaskbarOverlayOrder] Exception: " + ex);
+            }
+            finally
+            {
+                _isReconciling = false;
             }
         }
     }
