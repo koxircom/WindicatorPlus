@@ -215,35 +215,32 @@ namespace WindicatorPlus
                 }
                 CheckBudget(probeStopwatch, "FindChevronCompleted");
 
-                // Stage 2: Find TaskbarFrame / TaskbarFrameRepeater (Win11) 或 MSTaskListWClass (Win10)
+                // Stage 2: 优先探测 Windows 11 的 XAML TaskbarFrameRepeater / TaskbarFrame；只有无 Win11 容器时才回退至 Win10 MSTaskListWClass
                 currentStage = "FindRepeater";
-                IUIAutomationElement targetContainer = null;
+                IUIAutomationElement targetContainer = FindTaskbarFrameRepeaterInternal(taskbarElem, walker, tracker, probeStopwatch);
                 IntPtr hWin10TaskList = IntPtr.Zero;
 
-                // 2.1 探测 Windows 10 原生任务栏应用列表窗口 (MSTaskListWClass)
-                IntPtr hReBar = NativeMethods.FindWindowEx(hTaskbar, IntPtr.Zero, "ReBarWindow32", null);
-                if (hReBar != IntPtr.Zero)
-                {
-                    IntPtr hTaskSw = NativeMethods.FindWindowEx(hReBar, IntPtr.Zero, "MSTaskSwWClass", null);
-                    if (hTaskSw != IntPtr.Zero)
-                    {
-                        hWin10TaskList = NativeMethods.FindWindowEx(hTaskSw, IntPtr.Zero, "MSTaskListWClass", null);
-                    }
-                }
-                if (hWin10TaskList == IntPtr.Zero)
-                {
-                    hWin10TaskList = NativeMethods.FindWindowEx(hTaskbar, IntPtr.Zero, "MSTaskListWClass", null);
-                }
-
-                if (hWin10TaskList != IntPtr.Zero)
-                {
-                    targetContainer = tracker.Track(_uia.ElementFromHandle(hWin10TaskList));
-                }
-
-                // 2.2 若非 Win10，则走 Windows 11 的 XAML TaskbarFrameRepeater / TaskbarFrame
                 if (targetContainer == null)
                 {
-                    targetContainer = FindTaskbarFrameRepeaterInternal(taskbarElem, walker, tracker, probeStopwatch);
+                    // 仅在无 Win11 XAML 容器时回退探测 Windows 10 原生任务栏应用列表窗口 (MSTaskListWClass)
+                    IntPtr hReBar = NativeMethods.FindWindowEx(hTaskbar, IntPtr.Zero, "ReBarWindow32", null);
+                    if (hReBar != IntPtr.Zero)
+                    {
+                        IntPtr hTaskSw = NativeMethods.FindWindowEx(hReBar, IntPtr.Zero, "MSTaskSwWClass", null);
+                        if (hTaskSw != IntPtr.Zero)
+                        {
+                            hWin10TaskList = NativeMethods.FindWindowEx(hTaskSw, IntPtr.Zero, "MSTaskListWClass", null);
+                        }
+                    }
+                    if (hWin10TaskList == IntPtr.Zero)
+                    {
+                        hWin10TaskList = NativeMethods.FindWindowEx(hTaskbar, IntPtr.Zero, "MSTaskListWClass", null);
+                    }
+
+                    if (hWin10TaskList != IntPtr.Zero)
+                    {
+                        targetContainer = tracker.Track(_uia.ElementFromHandle(hWin10TaskList));
+                    }
                 }
                 CheckBudget(probeStopwatch, "FindRepeaterCompleted");
 
@@ -377,7 +374,8 @@ namespace WindicatorPlus
             int r = rect.right;
             if (r > trayLeft)
             {
-                throw new InvalidOperationException("App and tray regions intersect");
+                // 契约：已在正确应用容器内的按钮右边跨 trayLeft 应当视已满（边界封顶 trayLeft）而非异常 Invalid
+                r = trayLeft;
             }
 
             if (r > maxAppRight)

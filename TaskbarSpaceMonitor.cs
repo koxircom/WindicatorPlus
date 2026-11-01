@@ -439,7 +439,13 @@ namespace WindicatorPlus
 
             int trayLeft = trRect.Left;
             if (trayLeft <= tbRect.Left || trayLeft > tbRect.Right) return TaskbarSpaceSnapshot.Invalid();
-            if (validButtonsCount <= 0 || maxAppRight <= 0 || maxAppRight > trayLeft) return TaskbarSpaceSnapshot.Invalid();
+            if (validButtonsCount <= 0 || maxAppRight <= 0) return TaskbarSpaceSnapshot.Invalid();
+
+            // 必要安全饱和处理：应用按钮右边界顶到或跨过 trayLeft 时视作已满（边界封顶 trayLeft），而非异常 Invalid
+            if (maxAppRight > trayLeft)
+            {
+                maxAppRight = trayLeft;
+            }
 
             return new TaskbarSpaceSnapshot(maxAppRight, trayLeft, tbRect, trRect, true);
         }
@@ -731,6 +737,12 @@ namespace WindicatorPlus
                 if (validButtonsCount == 0 || maxAppRight <= 0)
                 {
                     return TaskbarProbeResult.Permanent("NoValidAppButtons", null, nativeTrRect, observedChevronRect, effectiveTrRect, maxAppRight);
+                }
+
+                // 必要安全饱和处理：若 Chevron 向左展开使得 trayLeft < maxAppRight，封顶为 trayLeft
+                if (maxAppRight > trayLeft)
+                {
+                    maxAppRight = trayLeft;
                 }
 
                 _lastNativeTrayRect = nativeTrRect;

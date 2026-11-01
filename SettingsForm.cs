@@ -10,7 +10,7 @@ namespace WindicatorPlus
 {
     public class SettingsForm : Form
     {
-        public const string CURRENT_VERSION = "v1.3.13";
+        public const string CURRENT_VERSION = "v1.3.15";
 
 
         private AppConfig _config;
@@ -70,15 +70,6 @@ namespace WindicatorPlus
 
         private bool _isBindingUI = false;
 
-        protected override CreateParams CreateParams
-        {
-            get
-            {
-                CreateParams cp = base.CreateParams;
-                cp.ExStyle |= 0x02000000; // WS_EX_COMPOSITED: 内核级全控件树离屏双缓冲合成，彻底杜绝自上而下阶梯式扫描与黑白线框撕裂
-                return cp;
-            }
-        }
 
         public SettingsForm(AppConfig config, WatermarkWindow watermark, TrayIconManager trayManager, DesktopWatcher watcher)
         {

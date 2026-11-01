@@ -3,9 +3,9 @@ using System.Diagnostics;
 using System.Threading;
 using System.Windows.Forms;
 
-[assembly: System.Reflection.AssemblyVersion("1.3.13.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.3.13.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.3.13")]
+[assembly: System.Reflection.AssemblyVersion("1.3.15.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.3.15.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.3.15")]
 
 namespace WindicatorPlus
 {
@@ -44,7 +44,7 @@ namespace WindicatorPlus
                 return;
             }
 
-            RuntimeTrace.LogAppStart(Process.GetCurrentProcess().Id, "1.3.13");
+            RuntimeTrace.LogAppStart(Process.GetCurrentProcess().Id, "1.3.15");
 
             Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
             Application.ThreadException += (s, e) => { };

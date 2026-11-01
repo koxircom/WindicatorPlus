@@ -1374,7 +1374,34 @@ namespace WindicatorPlus
                     };
                 }
 
-                bool spaceFitsInTaskbar = (adaptiveResult.IsVisible && adaptiveResult.Mode != TaskbarAdaptiveMode.Hidden);
+                // 契约：停靠必须完整当前标题/数字安全容纳，不能降级省略/纯数字硬塞。可在 Update 决策只接纳 Full 且边界检查，不够则浮动 Bottom<=tb.Top-8，有空间自动回栏
+                bool isFullContentAccepted = false;
+                if (adaptiveResult.IsVisible)
+                {
+                    if (!string.IsNullOrEmpty(titleText))
+                    {
+                        // 有标题时严格只接纳 Full，绝不降级为 Ellipsis 或 NumberOnly 硬塞
+                        isFullContentAccepted = (adaptiveResult.Mode == TaskbarAdaptiveMode.Full);
+                    }
+                    else if (_showBigNumber)
+                    {
+                        // 无标题且配置大数字时：大数字本身即为完整内容
+                        isFullContentAccepted = (adaptiveResult.Mode == TaskbarAdaptiveMode.NumberOnly);
+                    }
+                }
+
+                bool boundsCheckPassed = false;
+                if (isFullContentAccepted && adaptiveResult.Width > 0 && adaptiveResult.Width <= availableWidth)
+                {
+                    int requiredMinLeft = (maxAppRight > 0) ? (maxAppRight + safetyGap) : (tbRect.Left + safetyGap);
+                    int calculatedPosX = anchorRight - adaptiveResult.Width;
+                    if (calculatedPosX >= requiredMinLeft && (calculatedPosX + adaptiveResult.Width) <= anchorRight)
+                    {
+                        boundsCheckPassed = true;
+                    }
+                }
+
+                bool spaceFitsInTaskbar = isFullContentAccepted && boundsCheckPassed;
                 _isTaskbarOverflowFloating = !spaceFitsInTaskbar;
 
                 if (!_isTaskbarOverflowFloating)

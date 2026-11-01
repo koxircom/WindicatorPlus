@@ -375,30 +375,19 @@ namespace WindicatorPlus.Tests
                 throw new Exception("Zero-width button must throw InvalidOperationException('App button geometry unavailable')");
             }
 
-            // 4. App button intersecting tray (right > trayLeft) must throw
-            var intersectingApp = new MockAutomationElement
+            // 4. App button crossing tray (right > trayLeft) saturates to trayLeft instead of throwing
+            var crossingApp = new MockAutomationElement
             {
                 MockControlType = 50000,
-                MockAutomationId = "AppOverlap",
+                MockAutomationId = "AppCrossing",
                 MockClassName = "TaskbarAppButton",
-                MockName = "Overlap",
+                MockName = "Crossing",
                 MockBoundingRectangle = new tagRECT { left = 900, top = 0, right = 1050, bottom = 48 }
             };
-            bool threwIntersect = false;
-            try
+            bool r4 = NativeTaskbarAutomation.ProcessAppButtonCached(crossingApp, trayLeft, ref maxAppRight);
+            if (!r4 || maxAppRight != trayLeft)
             {
-                NativeTaskbarAutomation.ProcessAppButtonCached(intersectingApp, trayLeft, ref maxAppRight);
-            }
-            catch (InvalidOperationException ex)
-            {
-                if (ex.Message == "App and tray regions intersect")
-                {
-                    threwIntersect = true;
-                }
-            }
-            if (!threwIntersect)
-            {
-                throw new Exception("Intersecting button must throw InvalidOperationException('App and tray regions intersect')");
+                throw new Exception(string.Format("Crossing button must be valid and maxAppRight saturated to trayLeft ({0}), got: {1}", trayLeft, maxAppRight));
             }
         }
 
@@ -428,11 +417,11 @@ namespace WindicatorPlus.Tests
                 throw new Exception("maxAppRight <= 0 must result in invalid snapshot");
             }
 
-            // maxAppRight > trayLeft must be Invalid
+            // maxAppRight > trayLeft safely saturates to trayLeft
             var s4 = TaskbarSpaceMonitor.EvaluateTaskbarSnapshot(tbRect, trRect, 5, 1500);
-            if (s4.IsValid)
+            if (!s4.IsValid || s4.MaxAppRight != 1400)
             {
-                throw new Exception("maxAppRight > trayLeft must result in invalid snapshot");
+                throw new Exception(string.Format("maxAppRight > trayLeft must saturate to trayLeft (1400), got: valid={0}, maxAppRight={1}", s4.IsValid, s4.MaxAppRight));
             }
         }
 
